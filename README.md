@@ -155,3 +155,6 @@ CSV-Datei in `/home/hermes/tws_option_pipeline/src/tws_option_contracts_<SYMBOL>
 
 # Kurzform
 /home/hermes/tws_option_pipeline/venv/bin/python3 /home/hermes/tws_option_pipeline/src/multi_symbol_batch.py IBM -m --ot REL --chains 3 --dmin -0.30 --dmax -0.10 0 1 SMART USD
+
+
+aa
