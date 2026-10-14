@@ -58,11 +58,12 @@ python3 src/multi_symbol_batch.py [OPTIONEN] SYMBOL [MONTH_INDICES] [EXCHANGE] [
 | `--chains` | `--num-chains` | Anzahl Expirations zu scannen | alle |
 | `--delta-min` | `--dmin` | Min Delta (z.B. -0.30) | -0.50 |
 | `--delta-max` | `--dmax` | Max Delta (z.B. -0.10) | -0.10 |
+| `--bid-min` | `--bmin` | Min Bid Preis (z.B. 0.80) | 0.80 |
 
 ### Beispiele
 
 ```bash
-# Standard (LMT, Delta -0.50 bis -0.10, erste 2 Expirations)
+# Standard (LMT, Delta -0.50 bis -0.10, Bid ≥ 0.80, DTE ≤ 28, erste 2 Expirations)
 python3 src/multi_symbol_batch.py ZIM 0 1 SMART USD
 
 # REL Order Type (Pegged-to-Midpoint, Offset=0)
@@ -83,6 +84,15 @@ python3 src/multi_symbol_batch.py ZIM \
 
 # IBM Beispiel
 python3 src/multi_symbol_batch.py IBM -m --ot REL --chains 3 --dmin -0.30 --dmax -0.10 0 1 SMART USD
+
+# CROX mit allen Filtern (Delta -0.25 bis -0.15, Bid ≥ 0.80, DTE ≤ 28)
+python3 src/multi_symbol_batch.py CROX --chains 3 -m --ot REL --dmin -0.25 --dmax -0.15 --bid-min 0.80 0 1 SMART USD
+
+# ZIM mit Bid ≥ 0.80 (Default), DTE ≤ 28
+python3 src/multi_symbol_batch.py ZIM --chains 3 -m --ot REL 0 1 SMART USD
+
+# Custom Bid Minimum
+python3 src/multi_symbol_batch.py ZIM --chains 3 -m --bid-min 0.20 0 1 SMART USD
 ```
 
 ### Single-Symbol Pipeline
@@ -107,12 +117,12 @@ python3 src/close_position.py -h       # Hilfe
 
 ## Output
 
-- **CSV**: `src/multi_symbol_top5_<TIMESTAMP>.csv` (Top 5 pro Symbol)
-- **HTML**: `src/multi_symbol_top5_<TIMESTAMP>.html` (parallel zur CSV)
+- **CSV**: `output/multi_symbol_top5_<TIMESTAMP>.csv` (Top 5 pro Symbol)
+- **HTML**: `output/multi_symbol_top5_<TIMESTAMP>.html` (parallel zur CSV)
 
 **Spalten:** conid, symbol, right, expiration, strike, multiplier, bid, ask, last, close, volume, delta, gamma, theta, vega, impliedVol, bidSize, askSize, high, low, openPrice, openInterest, put_profit%, DTE
 
-**Filter:** Nur PUTs mit Delta -0.50 bis -0.10 (anpassbar)
+**Filter:** Nur PUTs mit Delta -0.50 bis -0.10, Bid ≥ 0.80, DTE ≤ 28 (alle anpassbar)
 
 ## Bekannte Limitationen
 

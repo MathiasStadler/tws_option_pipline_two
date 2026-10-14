@@ -456,9 +456,11 @@ def check_margin(ib, option, quantity=1, price=None):
         return True, est_required, available, f"Est. OK: ${est_required:,.0f} <= ${max_allowed:,.0f}"
 
 
-def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', limit_price=None, auto_transmit=False):
+def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', limit_price=None, auto_transmit=False, bracket=False, premium=None):
     """
     Platziert eine Option Order in TWS mit Bestätigung.
+    bracket=True: Erstellt Bracket Order (Take Profit 70% / Stop Loss 100% Premium)
+    premium: Premium für Bracket Berechnung (wenn None, wird limit_price/mid verwendet)
     Returns: True wenn Order platziert, False sonst.
     """
     try:
@@ -529,6 +531,24 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                 print(f"❌ Order übersprungen: {msg}")
                 return False
 
+        # Bracket Order Logic
+        if bracket and action == 'SELL' and option.right == 'P':
+            # Premium für Bracket berechnen
+            if premium is None:
+                premium = limit_price if limit_price else check_price
+            
+            take_profit_price = round(premium * 0.30, 2)  # 70% profit = buy back at 30%
+            stop_loss_price = round(premium * 2.00, 2)    # 100% loss = buy back at 200%
+            
+            print(f"\n📊 BRACKET ORDER:")
+            print(f"   Premium: ${premium:.2f}")
+            print(f"   Take Profit (70%): BUY @ ${take_profit_price:.2f}")
+            print(f"   Stop Loss (100%): BUY @ ${stop_loss_price:.2f}")
+            
+            return place_bracket_order(ib, option, quantity, order_type, limit_price, 
+                                       take_profit_price, stop_loss_price, auto_transmit)
+
+        # Normal Order (existing logic)
         order = Order()
         order.action = action
         order.orderType = order_type
@@ -601,11 +621,15 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                 if confirm in ['y', 'yes', 'j', 'ja']:
                     try:
                         trade.transmit = True
-                        try:
+                        # Warten bis Order einen finalen Status erreicht
+                        final_statuses = {'Filled', 'Cancelled', 'ApiCancelled', 'Inactive', 'Submitted'}
+                        for _ in range(10):  # Max 10 Sekunden warten
                             ib.sleep(1)
-                        except Exception as e:
-                            logger.warning(f"place_option_order: sleep interrupted - {e}")
+                            status = trade.orderStatus.status
+                            if status in final_statuses:
+                                break
                         logger.info(f"Order platziert: {trade.orderStatus.status}")
+                        print(f"Order Status: {trade.orderStatus.status}")
                         return True
                     except Exception as e:
                         handle_ibkr_error("place_option_order(transmit)", e, logger)
@@ -653,7 +677,7 @@ def write_master_csv(results, filepath):
     return False
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT'):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
@@ -714,7 +738,25 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
 
                 rows = fetch_option_greeks_batch(ib, options)
                 filtered = filter_by_delta(rows, min_delta=delta_min, max_delta=delta_max)
-
+                
+                # Filter by minimum bid and max 28 days to expiration
+                from datetime import datetime
+                now = datetime.now()
+                bid_filtered = []
+                for r in filtered:
+                    bid = r.get('bid')
+                    if bid is not None and bid >= bid_min:
+                        # Check DTE <= 28
+                        exp_str = r.get('expiration', '')
+                        try:
+                            exp_date = datetime.strptime(exp_str, '%Y%m%d')
+                            dte = (exp_date - now).days
+                            if dte <= 28:
+                                bid_filtered.append(r)
+                        except:
+                            bid_filtered.append(r)  # If parsing fails, keep it
+                filtered = bid_filtered
+                
                 for r in filtered:
                     r['expiration'] = expiration
                     bid = r.get('bid')
@@ -859,6 +901,7 @@ def main():
     num_chains = 0  # 0 = auto (use month_indices or default)
     order_type = 'LMT'  # LMT or REL
     output_dir = None  # Custom output directory
+    bid_min = 0.80  # Minimum bid price
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -887,6 +930,9 @@ def main():
                 if order_type not in ['LMT', 'REL']:
                     print(f"Error: --order-type must be LMT or REL, got {order_type}")
                     sys.exit(1)
+                i += 1
+            elif arg in ['--bid-min', '--bmin'] and i + 1 < len(args):
+                bid_min = float(args[i + 1])
                 i += 1
             elif arg in ['--output-dir', '-o'] and i + 1 < len(args):
                 output_dir = args[i + 1]
@@ -943,9 +989,9 @@ def main():
         cur = currency if currency != 'USD' else defaults['currency']
         
         # Don't keep connection for orders - create dedicated one later
-        result = process_symbol(symbol, month_indices, ex, cur, base_client_id + i, 
-                               keep_connected=False, delta_min=delta_min, delta_max=delta_max, 
-                               num_chains=num_chains, order_type=order_type)
+        result = process_symbol(symbol, month_indices, ex, cur, base_client_id + i,
+                               keep_connected=False, delta_min=delta_min, delta_max=delta_max,
+                               num_chains=num_chains, order_type=order_type, bid_min=bid_min)
         results.append(result)
         
         if 'error' in result:
