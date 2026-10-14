@@ -12,7 +12,30 @@ import socket
 import os
 from datetime import datetime
 from pathlib import Path
-from ib_insync import IB, Stock, Option, RequestError, FlexError
+
+try:
+    from ib_insync import IB, Stock, Option, RequestError, FlexError
+except ImportError as exc:  # pragma: no cover - optional dependency at runtime
+    class _MissingIBInsyncDependency:
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError(
+                "ib_insync is required to run this script. Install it with: pip install ib-insync"
+            ) from exc
+
+    class IB(_MissingIBInsyncDependency):
+        pass
+
+    class Stock(_MissingIBInsyncDependency):
+        pass
+
+    class Option(_MissingIBInsyncDependency):
+        pass
+
+    class RequestError(ImportError):
+        pass
+
+    class FlexError(ImportError):
+        pass
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s : %(message)s')
 logger = logging.getLogger(__name__)
