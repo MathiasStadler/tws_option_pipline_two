@@ -241,7 +241,9 @@ def write_csv(rows, filepath):
                 if h == "put_profit":
                     bid = r.get("bid")
                     strike = r.get("strike")
-                    if bid is not None and strike and strike != 0:
+                    if (bid is not None and not math.isnan(bid) and bid > 0
+                        and strike is not None and not math.isnan(strike) 
+                        and strike != 0):
                         val = (bid / strike) * 100
                     else:
                         val = None
@@ -307,6 +309,13 @@ def main():
         
         write_csv(filtered, csv_file)
         logger.info(f"CSV written: {csv_file}")
+        
+        # Print CSV content to console
+        print(f"\n{'='*80}")
+        print(f"CSV CONTENT: {csv_file}")
+        print(f"{'='*80}")
+        with open(csv_file, 'r') as f:
+            print(f.read())
         
         print(f"\n=== RESULT: {len(filtered)} PUT options with delta -0.50 to -0.10 ===")
         print(f"File: {csv_file}")
