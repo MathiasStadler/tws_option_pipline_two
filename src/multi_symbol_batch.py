@@ -606,18 +606,100 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
             else:
                 print(f"LimitPrice: MID (Market Mid-Price)")
             print(f"Contract:   {option.localSymbol}")
+            
+            # Margin Check für Short PUT
+            if action == 'SELL' and option.right == 'P':
+                # Verfügbare Funds holen
+                acct = ib.accountSummary()
+                available = 0.0
+                for v in acct:
+                    if v.tag == 'AvailableFunds':
+                        available = float(v.value)
+                        break
+                
+                if available > 0:
+                    # Margin Check mit whatIfOrder
+                    from ib_insync import Order
+                    test_order = Order()
+                    test_order.action = 'SELL'
+                    test_order.orderType = 'LMT'
+                    test_order.totalQuantity = quantity
+                    test_order.lmtPrice = round(limit_price, 2) if limit_price else 0
+                    test_order.tif = 'DAY'
+                    test_order.whatIf = True
+                    
+                    try:
+                        whatif_trade = ib.placeOrder(option, test_order)
+                        ib.sleep(1.5)
+                        required = 0.0
+                        if whatif_trade.orderStatus.marginChange is not None:
+                            required = abs(whatif_trade.orderStatus.marginChange)
+                        elif whatif_trade.orderStatus.initMarginChange is not None:
+                            required = abs(whatif_trade.orderStatus.initMarginChange)
+                        elif whatif_trade.orderStatus.maintMarginChange is not None:
+                            required = abs(whatif_trade.orderStatus.maintMarginChange)
+                        if required == 0 and limit_price:
+                            required = option.strike * 100 * 0.20
+            
+                        margin_pct = (required / available * 100) if available > 0 else 0
+                        max_allowed = available * 0.80
+                        ok = required <= max_allowed
+            
+                        print(f"Margin:     ${required:,.2f} / ${available:,.2f} ({margin_pct:.1f}%)")
+                        print(f"Max 80%:    ${max_allowed:,.2f} ({'OK' if ok else 'ÜBERSCHRITTEN'})")
+                    except Exception as e:
+                        logger.warning(f"Margin-Check fehlgeschlagen: {e}")
+                        # Fallback Schätzung
+                        est_required = option.strike * 100 * 0.20
+                        margin_pct = (est_required / available * 100) if available > 0 else 0
+                        max_allowed = available * 0.80
+                        ok = est_required <= max_allowed
+                        print(f"Margin(est): ${est_required:,.2f} / ${available:,.2f} ({margin_pct:.1f}%)")
+                        print(f"Max 80%:     ${max_allowed:,.2f} ({'OK' if ok else 'ÜBERSCHRITTEN'})")
+                else:
+                    print(f"Margin:     Nicht verfügbar")
+            
+            # Bracket Order Auswahl
+            use_bracket = False
+            tp_pct = 0.30  # 70% profit = 30% of premium
+            sl_pct = 2.00  # 100% loss = 200% of premium
+            if bracket and action == 'SELL' and option.right == 'P' and limit_price:
+                print(f"\nBracket Order Option:")
+                print(f"  Take Profit: 70% (Buy back @ 30% = ${limit_price * 0.30:.2f})")
+                print(f"  Stop Loss:   100% (Buy back @ 200% = ${limit_price * 2.00:.2f})")
+                print(f"  Standard:    70% / 100% (y/n/c für Custom): ", end="")
+                
+                try:
+                    bracket_choice = input().strip().lower()
+                    if bracket_choice in ['y', 'yes', 'j', 'ja']:
+                        use_bracket = True
+                    elif bracket_choice in ['c', 'custom']:
+                        try:
+                            tp_input = input("  Take Profit % (z.B. 70): ").strip()
+                            sl_input = input("  Stop Loss % (z.B. 100): ").strip()
+                            tp_pct = 1.0 - float(tp_input) / 100  # 70% -> 0.30
+                            sl_pct = float(sl_input) / 100 * 2  # 100% -> 2.0
+                            use_bracket = True
+                        except:
+                            print("  Ungültig, verwende Standard 70%/100%")
+                            use_bracket = True
+                except:
+                    pass
+            elif bracket and action == 'SELL' and option.right == 'P' and limit_price:
+                use_bracket = True
+            
             print(f"{'='*60}")
-
+            
             while True:
                 try:
-                    confirm = input("Order platzieren? (y/n): ").strip().lower()
+                                        confirm = input("Order platzieren? (y/n): ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     logger.info("place_option_order: User cancelled input")
                     try:
                         ib.cancelOrder(trade.order)
                     except Exception:
                         pass
-                    return False
+                        return False
                 if confirm in ['y', 'yes', 'j', 'ja']:
                     try:
                         trade.transmit = True
@@ -633,7 +715,7 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                         return True
                     except Exception as e:
                         handle_ibkr_error("place_option_order(transmit)", e, logger)
-                        return False
+                    return False
                 elif confirm in ['n', 'no', 'nein']:
                     try:
                         ib.cancelOrder(trade.order)
