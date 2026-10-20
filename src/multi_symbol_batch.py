@@ -652,6 +652,80 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     return False
 
 
+def place_bracket_order(ib, option, quantity, order_type, limit_price, take_profit_price, stop_loss_price, auto_transmit=False):
+    """
+    Erstellt eine Bracket Order für Short PUT:
+    - Parent: SELL PUT @ limit_price (oder REL)
+    - Take Profit: BUY @ take_profit_price (30% of premium = 70% profit)
+    - Stop Loss: BUY @ stop_loss_price (200% of premium = 100% loss)
+    """
+    from ib_insync import Order
+    
+    # Parent Order (SELL PUT)
+    parent = Order()
+    parent.action = 'SELL'
+    parent.orderType = order_type
+    parent.totalQuantity = quantity
+    parent.tif = 'DAY'
+    parent.transmit = False  # Don't transmit yet
+    
+    if order_type == 'LMT':
+        parent.lmtPrice = round(limit_price, 2)
+    elif order_type == 'REL':
+        parent.auxPrice = 0  # Midpoint
+    
+    # Generate parent order ID
+    parent_id = ib.client.getReqId()
+    parent.orderId = parent_id
+    
+    # Take Profit Order (BUY back at 30% of premium)
+    tp_order = Order()
+    tp_order.action = 'BUY'
+    tp_order.orderType = 'LMT'
+    tp_order.totalQuantity = quantity
+    tp_order.lmtPrice = take_profit_price
+    tp_order.tif = 'DAY'
+    tp_order.parentId = parent_id
+    tp_order.transmit = False
+    
+    # Stop Loss Order (BUY back at 200% of premium)
+    sl_order = Order()
+    sl_order.action = 'BUY'
+    sl_order.orderType = 'STP'
+    sl_order.totalQuantity = quantity
+    sl_order.auxPrice = stop_loss_price  # Stop price
+    sl_order.tif = 'DAY'
+    sl_order.parentId = parent_id
+    sl_order.transmit = True  # Last order transmits all
+    
+    # Place all three orders
+    print(f"📊 Bracket Order platzieren:")
+    print(f"   Parent: SELL {quantity} {option.localSymbol} @ {order_type} {limit_price if limit_price else 'REL'}")
+    print(f"   Take Profit: BUY {quantity} @ ${take_profit_price:.2f} LMT (70% profit)")
+    print(f"   Stop Loss: BUY {quantity} @ ${stop_loss_price:.2f} STP (100% loss)")
+    
+    try:
+        # Place parent first
+        parent_trade = ib.placeOrder(option, parent)
+        ib.sleep(0.5)
+        
+        # Place take profit
+        tp_trade = ib.placeOrder(option, tp_order)
+        ib.sleep(0.5)
+        
+        # Place stop loss (transmits all)
+        sl_trade = ib.placeOrder(option, sl_order)
+        ib.sleep(1)
+        
+        logger.info(f"Bracket Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        print(f"✅ Bracket Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        return True
+        
+    except Exception as e:
+        handle_ibkr_error("place_bracket_order", e, logger)
+        return False
+
+
 def write_master_csv(results, filepath):
     try:
         with open(filepath, 'w', newline='') as f:
@@ -677,7 +751,7 @@ def write_master_csv(results, filepath):
     return False
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
@@ -902,6 +976,7 @@ def main():
     order_type = 'LMT'  # LMT or REL
     output_dir = None  # Custom output directory
     bid_min = 0.80  # Minimum bid price
+    bracket_mode = False  # Bracket Order (Take Profit 70% / Stop Loss 200%)
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -934,6 +1009,8 @@ def main():
             elif arg in ['--bid-min', '--bmin'] and i + 1 < len(args):
                 bid_min = float(args[i + 1])
                 i += 1
+            elif arg in ['--bracket', '-b']:
+                bracket_mode = True
             elif arg in ['--output-dir', '-o'] and i + 1 < len(args):
                 output_dir = args[i + 1]
                 i += 1
@@ -991,7 +1068,8 @@ def main():
         # Don't keep connection for orders - create dedicated one later
         result = process_symbol(symbol, month_indices, ex, cur, base_client_id + i,
                                keep_connected=False, delta_min=delta_min, delta_max=delta_max,
-                               num_chains=num_chains, order_type=order_type, bid_min=bid_min)
+                               num_chains=num_chains, order_type=order_type, bid_min=bid_min,
+                               bracket_mode=bracket_mode)
         results.append(result)
         
         if 'error' in result:
@@ -1069,13 +1147,26 @@ def main():
         
             while True:
                 try:
-                    choice = input("\nOption(en) wählen: ").strip().lower()
+                    choice = input("\nOption(en) wählen (l=list, q=quit): ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     print("\nAbbruch.")
                     break
                 if choice in ['q', 'quit', 'exit']:
                     break
-
+                elif choice in ['l', 'list']:
+                    # Re-list available options
+                    print(f"\nVerfügbare Optionen (Top 5 pro Symbol):")
+                    for idx, r in enumerate(all_top_options):
+                        exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
+                        try:
+                            exp_date = datetime.strptime(r['expiration'], '%Y%m%d')
+                            dte = (exp_date - datetime.now()).days
+                        except:
+                            dte = '?'
+                        print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
+                    print(f"\nEingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q' zum Beenden")
+                    continue
+                
                 parts = choice.replace(',', ' ').split()
                 try:
                     indices = [int(p) - 1 for p in parts]
@@ -1112,7 +1203,7 @@ def main():
                                 print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
                             placed = place_option_order(order_ib, opt, action='SELL', quantity=1, 
                                                        order_type=order_type, limit_price=limit_price, 
-                                                       auto_transmit=False)
+                                                       auto_transmit=False, bracket=bracket_mode)
                             if placed:
                                 print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
                             else:
@@ -1176,7 +1267,7 @@ def main():
                             print(f">>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
                         placed = place_option_order(order_ib, opt, action='SELL', quantity=1, 
                                                    order_type=order_type, limit_price=limit_price, 
-                                                   auto_transmit=False)
+                                                   auto_transmit=False, bracket=bracket_mode)
                         if placed:
                             print(f"✅ {symbol} PUT Order erfolgreich platziert!")
                         else:
