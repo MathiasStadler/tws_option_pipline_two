@@ -140,3 +140,5 @@ python3 src/close_position.py -h       # Hilfe
 | `MKT` | Market Order |
 
 * `MID` wird von IBKR für Optionen **nicht** unterstützt.
+
+bevor take profit
