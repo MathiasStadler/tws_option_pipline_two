@@ -272,6 +272,7 @@ def write_csv(rows, filepath):
             writer.writerow(out_row)
 
 
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python3 tws_pipeline.py <SYMBOL> [MONTH_INDEX] [EXCHANGE] [CURRENCY]")
