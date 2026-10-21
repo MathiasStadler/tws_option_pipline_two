@@ -1516,11 +1516,15 @@ def main():
         if manual_mode:
             # MANUAL MODE: User selects which option(s) to trade
             print(f"\n{'='*80}")
-            print(f"MANUAL MODE: Wählen Sie Option(en) zum Handeln")
+            is_spread_mode = spread_mode
+            if is_spread_mode:
+                print(f"MANUAL MODE: Wählen Sie Bull Put Spread(s) zum Handeln")
+            else:
+                print(f"MANUAL MODE: Wählen Sie Option(en) zum Handeln")
             print(f"{'='*80}")
         
             # Show all options with numbers
-            print(f"\nVerfügbare Optionen (Top 5 pro Symbol):")
+            print(f"\nVerfügbare {'Spreads' if is_spread_mode else 'Optionen'} (Top 5 pro Symbol):")
             for idx, r in enumerate(all_top_options):
                 exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
                 # Calculate DTE (Days to Expiration)
@@ -1530,7 +1534,10 @@ def main():
                 except Exception as e:
                     logger.warning(f"main: DTE calculation failed - {type(e).__name__}: {e}")
                     dte = '?'
-                print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
+                if is_spread_mode:
+                    print(f"  [{idx+1}] {r['symbol']} {r['short_strike']:.0f}/{r['long_strike']:.0f}P {exp_short} | DTE={dte}d | Credit=${r['credit']:.2f} | Margin=${r['margin_req']:.0f} | ROM={r['rom']:.1f}% | POP={r['pop']:.1f}% | Short Δ={r['short_delta']:.4f}")
+                else:
+                    print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
         
             print(f"\nEingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q' zum Beenden")
         
@@ -1544,15 +1551,19 @@ def main():
                     break
                 elif choice in ['l', 'list']:
                     # Re-list available options
-                    print(f"\nVerfügbare Optionen (Top 5 pro Symbol):")
+                    print(f"\nVerfügbare {'Spreads' if is_spread_mode else 'Optionen'} (Top 5 pro Symbol):")
                     for idx, r in enumerate(all_top_options):
                         exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
                         try:
                             exp_date = datetime.strptime(r['expiration'], '%Y%m%d')
                             dte = (exp_date - datetime.now()).days
-                        except:
+                        except Exception as e:
+                            logger.warning(f"main: DTE calculation failed - {type(e).__name__}: {e}")
                             dte = '?'
-                        print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
+                        if is_spread_mode:
+                            print(f"  [{idx+1}] {r['symbol']} {r['short_strike']:.0f}/{r['long_strike']:.0f}P {exp_short} | DTE={dte}d | Credit=${r['credit']:.2f} | Margin=${r['margin_req']:.0f} | ROM={r['rom']:.1f}% | POP={r['pop']:.1f}% | Short Δ={r['short_delta']:.4f}")
+                        else:
+                            print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
                     print(f"\nEingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q' zum Beenden")
                     continue
                 
