@@ -2,6 +2,7 @@
 # Multi-Symbol Batch Pipeline: Sequentiell mit IBKR (kein Threading-Problem)
 # Usage: python3 multi_symbol_batch.py [SYMBOLS...] [MONTH_INDICES...] [EXCHANGE] [CURRENCY]
 
+# human change
 import sys
 import csv
 import logging
