@@ -37,7 +37,7 @@ except ImportError as exc:  # pragma: no cover - optional dependency at runtime
     class FlexError(ImportError):
         pass
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s : %(message)s')
+# Logging will be configured in main() after argument parsing
 logger = logging.getLogger(__name__)
 
 
@@ -201,14 +201,16 @@ def estimate_atm_iv(chain, stock_price):
         return 0.3
 
 def get_strike_range_for_delta(chain, stock_price, expiration, min_delta=-0.50, max_delta=-0.10, r=0.05):
+    """Returns list of strikes with BS delta in range, not just min/max.
+    This avoids requesting market data for strikes that won't have quotes."""
     try:
         exp_date = datetime.strptime(expiration, '%Y%m%d')
         T = (exp_date - datetime.now()).days / 365.0
         if T <= 0:
-            return None, None
+            return []
     except Exception as e:
         logger.warning(f"get_strike_range_for_delta: Date parse error - {type(e).__name__}: {e}")
-        return None, None
+        return []
 
     try:
         sigma = estimate_atm_iv(chain, stock_price)
@@ -221,11 +223,14 @@ def get_strike_range_for_delta(chain, stock_price, expiration, min_delta=-0.50, 
                 valid_strikes.append(strike)
 
         if not valid_strikes:
-            return None, None
-        return min(valid_strikes), max(valid_strikes)
+            logger.warning(f"  No strikes in delta range {min_delta} to {max_delta}")
+            return []
+        
+        logger.info(f"  Delta-filtered strikes: {valid_strikes}")
+        return valid_strikes
     except Exception as e:
         handle_ibkr_error("get_strike_range_for_delta", e, logger)
-        return None, None
+        return []
 
 
 def connect_ib(client_id):
@@ -315,14 +320,34 @@ def get_stock_data(ib, stock, timeout: float = 5.0):
     return None
 
 
-def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike):
+def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike, stock_price=None, valid_strikes=None):
     try:
         options = []
-        for strike in chain.strikes:
+        # If valid_strikes provided, use those directly (from BS delta filter)
+        # Otherwise iterate all chain.strikes with min/max/moneyness filters
+        strikes_to_use = valid_strikes if valid_strikes is not None else chain.strikes
+        
+        # Filter: nur 5-Punkt-Strikes (liquide US-Standard), keine 2.5-Punkt (existieren oft nicht)
+        strikes_to_use = [s for s in strikes_to_use if abs(s % 5) < 0.01]
+        
+        # Begrenzen auf max 5 liquideste Strikes (nahe ATM) für Paper Delayed Data
+        # Sortiere nach Moneyness (näher an 1.0 = ATM)
+        if stock_price is not None and len(strikes_to_use) > 5:
+            strikes_to_use.sort(key=lambda s: abs(s / stock_price - 1.0))
+            strikes_to_use = strikes_to_use[:5]
+            logger.info(f"  Limited to top 5 ATM strikes for market data: {strikes_to_use}")
+        
+        for strike in strikes_to_use:
             if min_strike is not None and strike < min_strike:
                 continue
             if max_strike is not None and strike > max_strike:
                 continue
+            # Filter: nur Strikes in sinnvollem Moneyness-Bereich (70%-130% von Spot)
+            # Paper Delayed Data liefert nur für liquide Strikes nahe ATM Bids
+            if stock_price is not None:
+                moneyness = strike / stock_price
+                if moneyness < 0.70 or moneyness > 1.30:
+                    continue
             opt = Option(symbol, expiration, strike, 'P', exchange, tradingClass=chain.tradingClass, multiplier=chain.multiplier)
             options.append(opt)
 
@@ -337,44 +362,22 @@ def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, m
 
 
 def fetch_option_greeks_batch(ib, options):
+    """Batch: subscribe all, wait once, collect all, cancel all. (wie tws_pipeline.py)"""
     if not options:
         return []
 
-    # Request market data for all
+    # Subscribe all
     for opt in options:
         try:
             ib.reqMktData(opt, '', False, False)
         except Exception as e:
             logger.warning(f"fetch_option_greeks_batch: reqMktData failed for {opt.localSymbol}: {e}")
 
-    # Poll for delayed market data (paper account needs more time)
-    import time
-    import math
-    start_time = time.time()
-    timeout = 15.0  # 15 Sekunden für delayed data (Paper Account)
-    poll_count = 0
-    while time.time() - start_time < timeout:
-        try:
-            ib.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"fetch_option_greeks_batch: sleep interrupted: {e}")
-        poll_count += 1
-        # Check if we have at least some valid bid/ask data (not None, not NaN)
-        has_data = False
-        for opt in options:
-            ticker = ib.ticker(opt)
-            if ticker:
-                bid = ticker.bid
-                ask = ticker.ask
-                if (bid is not None and not (isinstance(bid, float) and math.isnan(bid))) or \
-                   (ask is not None and not (isinstance(ask, float) and math.isnan(ask))):
-                    has_data = True
-                    break
-        if has_data:
-            logger.info(f"fetch_option_greeks_batch: Got market data after {poll_count * 0.5:.1f}s")
-            break
-    else:
-        logger.warning(f"fetch_option_greeks_batch: Timeout after {timeout}s, no valid bid/ask data received")
+    # Single wait for all (3s wie in tws_pipeline.py)
+    try:
+        ib.sleep(3)
+    except Exception as e:
+        logger.warning(f"fetch_option_greeks_batch: sleep interrupted: {e}")
 
     results = []
     for opt in options:
@@ -820,16 +823,16 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     print(f"   OCA Type: 1 (One-Cancels-All)")
     
     try:
-        # Place all three orders (transmit only the last one)
+        # Place all three orders rapidly (no sleep between)
+        # Only the LAST order transmits = all 3 sent atomar
         parent_trade = ib.placeOrder(option, parent)
-        ib.sleep(0.3)
-        
         tp_trade = ib.placeOrder(option, tp_order)
-        ib.sleep(0.3)
         
         # Last order transmits all
         sl_order.transmit = True
         sl_trade = ib.placeOrder(option, sl_order)
+        
+        # Brief wait for confirmation
         ib.sleep(1)
         
         logger.info(f"OCA Group Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}, Group={oca_group}")
@@ -921,12 +924,12 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
 
                 stock_price = stock_data['last'] or stock_data['close']
 
-                min_strike, max_strike = get_strike_range_for_delta(chain, stock_price, expiration, min_delta=delta_min, max_delta=delta_max)
-                if min_strike is None:
+                valid_strikes = get_strike_range_for_delta(chain, stock_price, expiration, min_delta=delta_min, max_delta=delta_max)
+                if not valid_strikes:
                     logger.warning(f"  {symbol} {expiration}: Keine Strikes im Delta-Bereich")
                     continue
 
-                options = get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike)
+                options = get_valid_put_options(ib, symbol, expiration, chain, exchange, min(valid_strikes), max(valid_strikes), stock_price=stock_price, valid_strikes=valid_strikes)
                 if not options:
                     continue
 
@@ -943,12 +946,12 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                     bid = r.get('bid')
                     logger.debug(f"Option {r.get('symbol')} {r.get('strike')} {r.get('expiration')}: bid={bid}, delta={r.get('delta')}")
                     if bid is not None and bid >= bid_min:
-                        # Check DTE <= 28
+                        # Check DTE <= 45 (erhöht von 28 für Monthly Options)
                         exp_str = r.get('expiration', '')
                         try:
                             exp_date = datetime.strptime(exp_str, '%Y%m%d')
                             dte = (exp_date - now).days
-                            if dte <= 28:
+                            if dte <= 45:
                                 bid_filtered.append(r)
                         except:
                             bid_filtered.append(r)  # If parsing fails, keep it
@@ -1101,6 +1104,7 @@ def main():
     output_dir = None  # Custom output directory
     bid_min = 0.80  # Minimum bid price
     bracket_mode = False  # Bracket Order (Take Profit 70% / Stop Loss 200%)
+    verbose = False  # Verbose logging
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -1115,6 +1119,8 @@ def main():
             arg = args[i]
             if arg in ['-m', '--manual']:
                 manual_mode = True
+            elif arg in ['-v', '--verbose']:
+                verbose = True
             elif arg in ['--delta-min', '--dmin'] and i + 1 < len(args):
                 delta_min = float(args[i + 1])
                 i += 1
@@ -1163,6 +1169,16 @@ def main():
         month_indices = default_month_indices
         exchange = 'SMART'
         currency = 'USD'
+    
+    # Configure logging based on verbose flag
+    log_level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s : %(message)s')
+    
+    # Also set ib_insync logger to WARNING to suppress its INFO messages
+    if not verbose:
+        logging.getLogger('ib_insync').setLevel(logging.WARNING)
+        logging.getLogger('ib_insync.ib').setLevel(logging.WARNING)
+        logging.getLogger('ib_insync.client').setLevel(logging.WARNING)
     
     # Configurable output path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
