@@ -1578,36 +1578,64 @@ def main():
 
                     for idx in valid:
                         selected = all_top_options[idx]
-                        # Place order for selected option
+                        # Place order for selected option/spread
                         try:
                             defaults = SYMBOL_DEFAULTS.get(selected['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
                             ex = defaults['exchange']
                             cur = defaults['currency']
                             
-                            # Use chain tradingClass if available
-                            trading_class = selected['symbol']  # fallback
-                            
-                            opt = create_put_option(selected['symbol'], selected['expiration'], 
-                                                   selected['strike'], selected['multiplier'],
-                                                   ex, trading_class)
-                            order_ib.qualifyContracts(opt)
-
-                            mark_price = get_mark_price(order_ib, opt)
-                            
-                            if order_type == 'LMT':
-                                limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
-                                print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                            if is_spread_mode:
+                                # BULL PUT SPREAD: Create both legs
+                                trading_class = selected['symbol']
+                                
+                                # Short leg (higher strike)
+                                short_opt = create_put_option(selected['symbol'], selected['expiration'],
+                                                             selected['short_strike'], selected.get('multiplier', 100),
+                                                             ex, trading_class)
+                                # Long leg (lower strike)
+                                long_opt = create_put_option(selected['symbol'], selected['expiration'],
+                                                            selected['long_strike'], selected.get('multiplier', 100),
+                                                            ex, trading_class)
+                                order_ib.qualifyContracts(short_opt, long_opt)
+                                
+                                print(f"\n>>> Platzieren BULL PUT SPREAD:")
+                                print(f"   Short: SELL 1 {short_opt.localSymbol}")
+                                print(f"   Long:  BUY  1 {long_opt.localSymbol}")
+                                print(f"   Credit Target: ${selected['credit']:.2f} | Margin: ${selected['margin_req']:.0f}")
+                                
+                                placed = place_spread_order(order_ib, short_opt, long_opt,
+                                                          quantity=1, order_type=order_type,
+                                                          credit_limit_price=selected['credit'],
+                                                          auto_transmit=False)
+                                if placed:
+                                    print(f"✅ {selected['symbol']} BULL PUT SPREAD erfolgreich platziert!")
+                                else:
+                                    print(f"❌ {selected['symbol']} Spread Order nicht platziert.")
                             else:
-                                limit_price = None
-                                mid_price = mark_price if mark_price and mark_price > 0 else selected['bid']
-                                print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
-                            placed = place_option_order(order_ib, opt, action='SELL', quantity=1, 
-                                                       order_type=order_type, limit_price=limit_price, 
-                                                       auto_transmit=False, bracket=bracket_mode)
-                            if placed:
-                                print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
-                            else:
-                                print(f"❌ {selected['symbol']} Order nicht platziert.")
+                                # Regular single option
+                                trading_class = selected['symbol']  # fallback
+                                
+                                opt = create_put_option(selected['symbol'], selected['expiration'],
+                                                       selected['strike'], selected['multiplier'],
+                                                       ex, trading_class)
+                                order_ib.qualifyContracts(opt)
+                                
+                                mark_price = get_mark_price(order_ib, opt)
+                                
+                                if order_type == 'LMT':
+                                    limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
+                                    print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                                else:
+                                    limit_price = None
+                                    mid_price = mark_price if mark_price and mark_price > 0 else selected['bid']
+                                    print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
+                                placed = place_option_order(order_ib, opt, action='SELL', quantity=1,
+                                                           order_type=order_type, limit_price=limit_price,
+                                                           auto_transmit=False, bracket=bracket_mode)
+                                if placed:
+                                    print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
+                                else:
+                                    print(f"❌ {selected['symbol']} Order nicht platziert.")
                         except Exception as e:
                             handle_ibkr_error(f"main(manual:{selected['symbol']})", e, logger)
                             print(f"❌ {selected['symbol']} Fehler: {e}")
