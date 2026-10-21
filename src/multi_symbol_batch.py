@@ -964,7 +964,7 @@ def write_master_csv(results, filepath):
     return False
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False, spread_mode=False, spread_width=5, max_margin=1000):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False, spread_mode=False, spread_width=5, max_margin=1000, min_credit=0.80):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
@@ -1120,6 +1120,9 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                     credit = short_bid - long_ask  # Net credit received
                     if credit <= 0:
                         continue  # Not a valid credit spread
+                    
+                    if credit < min_credit:
+                        continue  # Credit below minimum target
                     
                     spread_width_actual = short_strike - long_opt.get('strike', 0)
                     max_loss = spread_width_actual * 100 - credit * 100  # Max loss per spread
@@ -1313,6 +1316,7 @@ def main():
     spread_mode = False  # Bull Put Spread Mode
     spread_width = 5  # Strike width for spread (default 5 points)
     max_margin = 1000  # Max margin per spread in USD
+    min_credit = 0.80  # Minimum credit target for spreads in USD
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -1356,6 +1360,9 @@ def main():
                 i += 1
             elif arg in ['--max-margin', '--mm'] and i + 1 < len(args):
                 max_margin = float(args[i + 1])
+                i += 1
+            elif arg in ['--min-credit', '--mc'] and i + 1 < len(args):
+                min_credit = float(args[i + 1])
                 i += 1
             elif arg in ['--output-dir', '-o'] and i + 1 < len(args):
                 output_dir = args[i + 1]
@@ -1449,7 +1456,7 @@ def main():
                                keep_connected=False, delta_min=delta_min, delta_max=delta_max,
                                num_chains=num_chains, order_type=order_type, bid_min=bid_min,
                                bracket_mode=bracket_mode, spread_mode=spread_mode,
-                               spread_width=spread_width, max_margin=max_margin)
+                               spread_width=spread_width, max_margin=max_margin, min_credit=min_credit)
         results.append(result)
         
         if 'error' in result:
