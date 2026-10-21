@@ -294,12 +294,12 @@ def get_stock_data(ib, stock, timeout: float = 5.0):
                 ib.sleep(0.5)
             except Exception as e:
                 logger.warning(f"get_stock_data: sleep interrupted - {e}")
-            # Check if we have meaningful data
-            if ticker.last is not None or ticker.close is not None or (ticker.bid and ticker.ask):
+            # Check if we have meaningful data (last > 0, not just != None since IB returns -1.0 as placeholder)
+            if (ticker.last is not None and ticker.last > 0) or ticker.close is not None or (ticker.bid is not None and ticker.ask is not None):
                 break
         data = {
             'conid': stock.conId, 'symbol': stock.symbol,
-            'bid': ticker.bid, 'ask': ticker.ask, 'last': ticker.last,
+            'bid': ticker.bid, 'ask': ticker.ask, 'last': ticker.last if ticker.last and ticker.last > 0 else None,
             'close': ticker.close, 'volume': ticker.volume,
             'high': ticker.high, 'low': ticker.low,
         }
@@ -347,10 +347,34 @@ def fetch_option_greeks_batch(ib, options):
         except Exception as e:
             logger.warning(f"fetch_option_greeks_batch: reqMktData failed for {opt.localSymbol}: {e}")
 
-    try:
-        ib.sleep(3)
-    except Exception as e:
-        logger.warning(f"fetch_option_greeks_batch: sleep interrupted: {e}")
+    # Poll for delayed market data (paper account needs more time)
+    import time
+    import math
+    start_time = time.time()
+    timeout = 15.0  # 15 Sekunden für delayed data (Paper Account)
+    poll_count = 0
+    while time.time() - start_time < timeout:
+        try:
+            ib.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"fetch_option_greeks_batch: sleep interrupted: {e}")
+        poll_count += 1
+        # Check if we have at least some valid bid/ask data (not None, not NaN)
+        has_data = False
+        for opt in options:
+            ticker = ib.ticker(opt)
+            if ticker:
+                bid = ticker.bid
+                ask = ticker.ask
+                if (bid is not None and not (isinstance(bid, float) and math.isnan(bid))) or \
+                   (ask is not None and not (isinstance(ask, float) and math.isnan(ask))):
+                    has_data = True
+                    break
+        if has_data:
+            logger.info(f"fetch_option_greeks_batch: Got market data after {poll_count * 0.5:.1f}s")
+            break
+    else:
+        logger.warning(f"fetch_option_greeks_batch: Timeout after {timeout}s, no valid bid/ask data received")
 
     results = []
     for opt in options:
@@ -736,12 +760,17 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
 
 def place_bracket_order(ib, option, quantity, order_type, limit_price, take_profit_price, stop_loss_price, auto_transmit=False):
     """
-    Erstellt eine Bracket Order für Short PUT:
+    Erstellt eine OCA Group Order für Short PUT:
     - Parent: SELL PUT @ limit_price (oder REL)
     - Take Profit: BUY @ take_profit_price (30% of premium = 70% profit)
     - Stop Loss: BUY @ stop_loss_price (200% of premium = 100% loss)
+    OCA Group: One-Cancels-All (ocaType=1)
     """
     from ib_insync import Order
+    import uuid
+    
+    # Eindeutige OCA Group ID
+    oca_group = f"OCA_{option.symbol}_{option.lastTradeDateOrContractMonth}_{uuid.uuid4().hex[:8]}"
     
     # Parent Order (SELL PUT)
     parent = Order()
@@ -749,16 +778,16 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     parent.orderType = order_type
     parent.totalQuantity = quantity
     parent.tif = 'DAY'
-    parent.transmit = False  # Don't transmit yet
+    parent.transmit = False
     
     if order_type == 'LMT':
         parent.lmtPrice = round(limit_price, 2)
     elif order_type == 'REL':
         parent.auxPrice = 0  # Midpoint
     
-    # Generate parent order ID
-    parent_id = ib.client.getReqId()
-    parent.orderId = parent_id
+    # OCA Group für Parent
+    parent.ocaGroup = oca_group
+    parent.ocaType = 1  # 1 = Cancel all remaining when one fills
     
     # Take Profit Order (BUY back at 30% of premium)
     tp_order = Order()
@@ -767,8 +796,9 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     tp_order.totalQuantity = quantity
     tp_order.lmtPrice = take_profit_price
     tp_order.tif = 'DAY'
-    tp_order.parentId = parent_id
     tp_order.transmit = False
+    tp_order.ocaGroup = oca_group
+    tp_order.ocaType = 1
     
     # Stop Loss Order (BUY back at 200% of premium)
     sl_order = Order()
@@ -777,30 +807,34 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     sl_order.totalQuantity = quantity
     sl_order.auxPrice = stop_loss_price  # Stop price
     sl_order.tif = 'DAY'
-    sl_order.parentId = parent_id
-    sl_order.transmit = True  # Last order transmits all
+    sl_order.transmit = False
+    sl_order.ocaGroup = oca_group
+    sl_order.ocaType = 1
     
     # Place all three orders
-    print(f"📊 Bracket Order platzieren:")
+    print(f"📊 OCA Group Order platzieren:")
+    print(f"   Group: {oca_group}")
     print(f"   Parent: SELL {quantity} {option.localSymbol} @ {order_type} {limit_price if limit_price else 'REL'}")
     print(f"   Take Profit: BUY {quantity} @ ${take_profit_price:.2f} LMT (70% profit)")
     print(f"   Stop Loss: BUY {quantity} @ ${stop_loss_price:.2f} STP (100% loss)")
+    print(f"   OCA Type: 1 (One-Cancels-All)")
     
     try:
-        # Place parent first
+        # Place all three orders (transmit only the last one)
         parent_trade = ib.placeOrder(option, parent)
-        ib.sleep(0.5)
+        ib.sleep(0.3)
         
-        # Place take profit
         tp_trade = ib.placeOrder(option, tp_order)
-        ib.sleep(0.5)
+        ib.sleep(0.3)
         
-        # Place stop loss (transmits all)
+        # Last order transmits all
+        sl_order.transmit = True
         sl_trade = ib.placeOrder(option, sl_order)
         ib.sleep(1)
         
-        logger.info(f"Bracket Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
-        print(f"✅ Bracket Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        logger.info(f"OCA Group Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}, Group={oca_group}")
+        print(f"✅ OCA Group platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        print(f"   OCA Group: {oca_group} (Type 1: One-Cancels-All)")
         return True
         
     except Exception as e:
@@ -840,6 +874,10 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
         ib = connect_ib(client_id)
         if ib is None:
             return {'symbol': symbol, 'error': f'Failed to connect to IBKR (clientId={client_id})'}
+
+        # Paper Account: Delayed-Frozen Market Data (Type 4) aktivieren
+        ib.reqMarketDataType(4)
+        logger.info("Market data type set to 4 (delayed-frozen)")
 
         stock, chain, _ = get_stock_and_chain(ib, symbol, month_indices[0], exchange, currency)
         if stock is None:
@@ -893,7 +931,9 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                     continue
 
                 rows = fetch_option_greeks_batch(ib, options)
+                logger.info(f"fetch_option_greeks_batch: {len(rows)} options returned, sample: {rows[:2] if rows else 'empty'}")
                 filtered = filter_by_delta(rows, min_delta=delta_min, max_delta=delta_max)
+                logger.info(f"filter_by_delta: {len(filtered)} options in delta range [{delta_min}, {delta_max}]")
                 
                 # Filter by minimum bid and max 28 days to expiration
                 from datetime import datetime
@@ -901,6 +941,7 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                 bid_filtered = []
                 for r in filtered:
                     bid = r.get('bid')
+                    logger.debug(f"Option {r.get('symbol')} {r.get('strike')} {r.get('expiration')}: bid={bid}, delta={r.get('delta')}")
                     if bid is not None and bid >= bid_min:
                         # Check DTE <= 28
                         exp_str = r.get('expiration', '')
@@ -912,6 +953,7 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                         except:
                             bid_filtered.append(r)  # If parsing fails, keep it
                 filtered = bid_filtered
+                logger.info(f"bid_min filter (>= {bid_min}): {len(filtered)} options remaining")
                 
                 for r in filtered:
                     r['expiration'] = expiration
@@ -1144,8 +1186,11 @@ def main():
         logger.info(f"Processing {symbol} ({i+1}/{len(symbols)})...")
         
         defaults = SYMBOL_DEFAULTS.get(symbol, {'exchange': exchange, 'currency': currency})
-        ex = exchange if exchange != 'SMART' else defaults['exchange']
-        cur = currency if currency != 'USD' else defaults['currency']
+        # Respect explicitly passed exchange/currency, only use defaults if not overridden
+        # Since default param is 'SMART'/'USD', we check if user provided non-default via sys.argv
+        # Simpler: always use passed exchange/currency (user intent), defaults only for fallback
+        ex = exchange
+        cur = currency
         
         # Don't keep connection for orders - create dedicated one later
         result = process_symbol(symbol, month_indices, ex, cur, base_client_id + i,
