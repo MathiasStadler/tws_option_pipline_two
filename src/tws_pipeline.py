@@ -21,16 +21,16 @@ HEADERS = [
 ]
 
 SYMBOL_DEFAULTS = {
-    'ALV':   {'exchange': 'XETRA', 'currency': 'EUR'},
-    'ASML':  {'exchange': 'AEB',   'currency': 'EUR'},
-    'SAP':   {'exchange': 'XETRA', 'currency': 'EUR'},
-    'SIE':   {'exchange': 'XETRA', 'currency': 'EUR'},
-    'VOW3':  {'exchange': 'XETRA', 'currency': 'EUR'},
-    'BMW':   {'exchange': 'XETRA', 'currency': 'EUR'},
-    'DTE':   {'exchange': 'XETRA', 'currency': 'EUR'},
-    'BAYN':  {'exchange': 'XETRA', 'currency': 'EUR'},
-    'BAS':   {'exchange': 'XETRA', 'currency': 'EUR'},
-    'DHL':   {'exchange': 'XETRA', 'currency': 'EUR'},
+    'ALV':   {'exchange': 'SMART', 'currency': 'EUR'},
+    'ASML':  {'exchange': 'SMART', 'currency': 'EUR'},
+    'SAP':   {'exchange': 'SMART', 'currency': 'EUR'},
+    'SIE':   {'exchange': 'SMART', 'currency': 'EUR'},
+    'VOW3':  {'exchange': 'SMART', 'currency': 'EUR'},
+    'BMW':   {'exchange': 'SMART', 'currency': 'EUR'},
+    'DTE':   {'exchange': 'SMART', 'currency': 'EUR'},
+    'BAYN':  {'exchange': 'SMART', 'currency': 'EUR'},
+    'BAS':   {'exchange': 'SMART', 'currency': 'EUR'},
+    'DHL':   {'exchange': 'SMART', 'currency': 'EUR'},
     'CROX':  {'exchange': 'SMART', 'currency': 'USD'},
     'TREX':  {'exchange': 'SMART', 'currency': 'USD'},
     'AAPL':  {'exchange': 'SMART', 'currency': 'USD'},
@@ -130,22 +130,30 @@ def get_stock_and_chain(ib, symbol, month_index=0, exchange='SMART', currency='U
     ib.qualifyContracts(stock)
     
     chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
-    chain = [c for c in chains if c.exchange == exchange]
-    if not chain:
-        chain = [c for c in chains if c.expirations]
-        if not chain:
-            raise ValueError(f"No option chain found for {symbol} on {exchange}")
-        chain = chain[0]
-        logger.info(f"Using chain from exchange: {chain.exchange}")
+    
+    # For European stocks, prefer EUREX for options
+    option_exchange = exchange
+    if currency == 'EUR':
+        # Prefer EUREX for European options
+        eurex_chains = [c for c in chains if c.exchange == 'EUREX' and c.expirations]
+        if eurex_chains:
+            chain = eurex_chains[0]
+            option_exchange = 'EUREX'
+        else:
+            chain = [c for c in chains if c.expirations][0]
     else:
+        # US stocks: use SMART or specified exchange
+        chain = [c for c in chains if c.exchange == exchange]
+        if not chain:
+            chain = [c for c in chains if c.expirations]
         chain = chain[0]
     
     if month_index >= len(chain.expirations):
         raise ValueError(f"Month index {month_index} out of range (max {len(chain.expirations)-1})")
     
     expiration = chain.expirations[month_index]
-    logger.info(f"Chain: {chain.tradingClass}, Expiration: {expiration}, All strikes: {len(chain.strikes)}")
-    return stock, chain, expiration
+    logger.info(f"Chain: exchange={chain.exchange}, tradingClass={chain.tradingClass}, Expiration: {expiration}, Strikes: {len(chain.strikes)}")
+    return stock, chain, expiration, option_exchange
 
 
 def get_stock_data(ib, stock):
@@ -241,7 +249,9 @@ def write_csv(rows, filepath):
                 if h == "put_profit":
                     bid = r.get("bid")
                     strike = r.get("strike")
-                    if bid is not None and strike and strike != 0:
+                    if (bid is not None and not math.isnan(bid) and bid > 0
+                        and strike is not None and not math.isnan(strike) 
+                        and strike != 0):
                         val = (bid / strike) * 100
                     else:
                         val = None
@@ -260,6 +270,7 @@ def write_csv(rows, filepath):
                 else:
                     out_row[h] = val
             writer.writerow(out_row)
+
 
 
 def main():
@@ -288,7 +299,7 @@ def main():
         ib = connect_ib()
         logger.info(f"Connected to TWS, server version: {ib.client.serverVersion()}")
         
-        stock, chain, expiration = get_stock_and_chain(ib, symbol, month_index, exchange, currency)
+        stock, chain, expiration, option_exchange = get_stock_and_chain(ib, symbol, month_index, exchange, currency)
         stock_data = get_stock_data(ib, stock)
         stock_price = stock_data['last'] or stock_data['close']
         logger.info(f"Stock: {stock.symbol} @ {stock_price} {currency}")
@@ -297,7 +308,7 @@ def main():
         min_strike, max_strike = get_strike_range_for_delta(chain, stock_price, expiration)
         
         # Nur relevante Strikes qualifizieren
-        options = get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike)
+        options = get_valid_put_options(ib, symbol, expiration, chain, option_exchange, min_strike, max_strike)
         logger.info(f"Fetching Greeks for {len(options)} pre-filtered options...")
         
         # Batch Request für alle
@@ -307,6 +318,13 @@ def main():
         
         write_csv(filtered, csv_file)
         logger.info(f"CSV written: {csv_file}")
+        
+        # Print CSV content to console
+        print(f"\n{'='*80}")
+        print(f"CSV CONTENT: {csv_file}")
+        print(f"{'='*80}")
+        with open(csv_file, 'r') as f:
+            print(f.read())
         
         print(f"\n=== RESULT: {len(filtered)} PUT options with delta -0.50 to -0.10 ===")
         print(f"File: {csv_file}")
