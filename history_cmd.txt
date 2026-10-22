@@ -41,3 +41,7 @@ python3 multi_symbol_batch.py CROX --spread --ot MKT --spread-width 5 --max-marg
 
 # Market Order mit Bracket (Take Profit / Stop Loss)
 python3 multi_symbol_batch.py CROX --ot MKT --bracket 0 1 SMART USD
+
+
+# Morgen weiter
+cd /home/hermes/tws_option_pipline_two-1 && source venv/bin/activate && python3 ../tws_option_pipline_two/src/multi_symbol_batch.py CROX --ot MKT --dmin -0.50 --dmax -0.10 0 1 SMART USD
