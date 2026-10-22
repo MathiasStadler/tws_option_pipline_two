@@ -525,6 +525,28 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
         elif order_type == 'MKT':
             order_type = 'MKT'
             limit_price = None  # MKT orders haben keinen Limit-Preis
+            # Für Margin-Check und Bracket: Preis holen
+            try:
+                ib.reqMktData(option, '', False, False)
+                try:
+                    ib.sleep(2)
+                except Exception as e:
+                    logger.warning(f"place_option_order: sleep interrupted - {e}")
+            except RequestError as e:
+                logger.error(f"place_option_order: reqMktData failed - {e}")
+                return False
+            
+            ticker = ib.ticker(option)
+            if ticker is None or ticker.bid is None or ticker.bid <= 0:
+                logger.warning(f"Kein gültiger Preis für {option.localSymbol}")
+                return False
+            
+            # Für MKT: bid für SELL, ask für BUY als Referenz
+            check_price = ticker.bid if action == 'SELL' else ticker.ask
+            try:
+                ib.cancelMktData(option)
+            except Exception:
+                pass
         else:
             order_type = 'LMT'
             if limit_price is None:
@@ -556,7 +578,6 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
 
         # MARGIN CHECK vor Auto-Order
         # Für REL Orders: Margin basierend auf Mid-Preis prüfen
-        check_price = limit_price
         if order_type == 'REL' and check_price is None:
             # Mid-Preis für Margin-Check holen
             try:
