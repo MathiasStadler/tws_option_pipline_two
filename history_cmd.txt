@@ -30,3 +30,14 @@
 
 # debug/verbose
 python3 multi_symbol_batch.py CROX AAPL TREX --chains 2 --dmin -0.50 --dmax -0.10 --bid-min 0.50 --bracket -v 0 1 SMART USD
+
+
+# weiter 
+# Market Order (Single Put)
+python3 multi_symbol_batch.py CROX --ot MKT --dmin -0.50 --dmax -0.10 0 1 SMART USD
+
+# Market Order (Spread)
+python3 multi_symbol_batch.py CROX --spread --ot MKT --spread-width 5 --max-margin 1000 0 1 SMART USD
+
+# Market Order mit Bracket (Take Profit / Stop Loss)
+python3 multi_symbol_batch.py CROX --ot MKT --bracket 0 1 SMART USD
