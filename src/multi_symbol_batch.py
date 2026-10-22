@@ -468,7 +468,7 @@ def check_margin(ib, option, quantity=1, price=None):
     # WhatIf Order für Margin-Check
     test_order = Order()
     test_order.action = 'SELL'
-    test_order.orderType = 'LMT'
+    test_order.orderType = order_type
     test_order.totalQuantity = quantity
     test_order.lmtPrice = round(price, 2) if price else 0
     test_order.tif = 'DAY'
@@ -518,10 +518,13 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     try:
         from ib_insync import Order
 
-        # Für REL Orders (Pegged-to-Midpoint): kein Limit-Preis, auxPrice=0 für Midpoint
+        # Für REL/MKT Orders: kein Limit-Preis
         if order_type == 'REL':
             order_type = 'REL'
             limit_price = None  # REL orders haben keinen Limit-Preis
+        elif order_type == 'MKT':
+            order_type = 'MKT'
+            limit_price = None  # MKT orders haben keinen Limit-Preis
         else:
             order_type = 'LMT'
             if limit_price is None:
@@ -655,8 +658,8 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                 print(f"LimitPrice: ${limit_price:.2f}")
             elif order_type == 'REL':
                 print(f"LimitPrice: REL (Pegged-to-Midpoint, Offset=0)")
-            else:
-                print(f"LimitPrice: MID (Market Mid-Price)")
+            elif order_type == 'MKT':
+                print(f"Type:       Market Order (no limit price)")
             print(f"Contract:   {option.localSymbol}")
             
             # Margin Check für Short PUT
@@ -674,9 +677,10 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                     from ib_insync import Order
                     test_order = Order()
                     test_order.action = 'SELL'
-                    test_order.orderType = 'LMT'
+                    test_order.orderType = order_type
                     test_order.totalQuantity = quantity
-                    test_order.lmtPrice = round(limit_price, 2) if limit_price else 0
+                    if order_type == 'LMT' and limit_price:
+                        test_order.lmtPrice = round(limit_price, 2)
                     test_order.tif = 'DAY'
                     test_order.whatIf = True
                     
@@ -744,14 +748,14 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
             
             while True:
                 try:
-                                        confirm = input("Order platzieren? (y/n): ").strip().lower()
+                    confirm = input("Order platzieren? (y/n): ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     logger.info("place_option_order: User cancelled input")
                     try:
                         ib.cancelOrder(trade.order)
                     except Exception:
                         pass
-                        return False
+                    return False
                 if confirm in ['y', 'yes', 'j', 'ja']:
                     try:
                         trade.transmit = True
@@ -939,6 +943,8 @@ def place_spread_order(ib, short_option, long_option, quantity, order_type, cred
         if order_type == 'LMT':
             short_order.lmtPrice = round(short_bid, 2)
             long_order.lmtPrice = round(long_ask, 2)
+        elif order_type == 'MKT':
+            pass  # Market orders
         
         net_credit = short_bid - long_ask
         if net_credit <= 0:
@@ -1370,8 +1376,8 @@ def main():
                 i += 1
             elif arg in ['--order-type', '--ot'] and i + 1 < len(args):
                 order_type = args[i + 1].upper()
-                if order_type not in ['LMT', 'REL']:
-                    print(f"Error: --order-type must be LMT or REL, got {order_type}")
+                if order_type not in ['LMT', 'REL', 'MKT']:
+                    print(f"Error: --order-type must be LMT, REL or MKT, got {order_type}")
                     sys.exit(1)
                 i += 1
             elif arg in ['--bid-min', '--bmin'] and i + 1 < len(args):
@@ -1644,10 +1650,13 @@ def main():
                                 if order_type == 'LMT':
                                     limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
                                     print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
-                                else:
+                                elif order_type == 'REL':
                                     limit_price = None
                                     mid_price = mark_price if mark_price and mark_price > 0 else selected['bid']
                                     print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
+                                elif order_type == 'MKT':
+                                    limit_price = None
+                                    print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ MKT (Market Order)")
                                 placed = place_option_order(order_ib, opt, action='SELL', quantity=1,
                                                            order_type=order_type, limit_price=limit_price,
                                                            auto_transmit=False, bracket=bracket_mode)
@@ -1744,10 +1753,13 @@ def main():
                             if order_type == 'LMT':
                                 limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
                                 print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
-                            else:
+                            elif order_type == 'REL':
                                 limit_price = None
                                 mid_price = mark_price if mark_price and mark_price > 0 else best['bid']
                                 print(f">>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
+                            elif order_type == 'MKT':
+                                limit_price = None
+                                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ MKT (Market Order)")
                             placed = place_option_order(order_ib, opt, action='SELL', quantity=1,
                                                        order_type=order_type, limit_price=limit_price,
                                                        auto_transmit=False, bracket=bracket_mode)
