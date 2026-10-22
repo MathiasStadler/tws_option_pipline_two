@@ -21,3 +21,12 @@
  1993  python3 src/multi_symbol_batch.py ELF --dmax -0.20 --bracket -m --chains 3 0 1 SMART USD
  1994  python3 src/multi_symbol_batch.py ELF --dmin -0.25 --dmax -0.15 --bracket -m 0 1 SMART USD
  1995  python3 src/multi_symbol_batch.py ELF --bracket -m 0 1 SMART USD
+
+
+
+ # normal
+ python3 multi_symbol_batch.py CROX AAPL TREX --chains 2 --dmin -0.50 --dmax -0.10 --bid-min 0.50 --bracket 0 1 SMART USD
+
+
+# debug/verbose
+python3 multi_symbol_batch.py CROX AAPL TREX --chains 2 --dmin -0.50 --dmax -0.10 --bid-min 0.50 --bracket -v 0 1 SMART USD
