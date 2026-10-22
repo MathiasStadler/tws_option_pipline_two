@@ -12,6 +12,13 @@ import socket
 import os
 from datetime import datetime
 from pathlib import Path
+from contextlib import redirect_stderr, contextmanager
+from io import StringIO
+
+@contextmanager
+def suppress_ib_stderr(verbose):
+    """No-op when using logging suppression."""
+    yield
 
 try:
     from ib_insync import IB, Stock, Option, RequestError, FlexError
@@ -233,11 +240,28 @@ def get_strike_range_for_delta(chain, stock_price, expiration, min_delta=-0.50, 
         return []
 
 
-def connect_ib(client_id):
+def connect_ib(client_id, verbose=False):
     try:
         ib = IB()
-        ib.connect('127.0.0.1', 7496, clientId=client_id, timeout=15, readonly=True)
-        ib.reqMarketDataType(4)
+        
+        # Custom error handler to filter informational codes
+        if not verbose:
+            # Informational codes that don't need to be shown
+            INFO_CODES = {10090, 10167, 2104, 2106, 2158, 2103, 2105, 2107, 2157}
+            def filter_errors(req_id, error_code, error_string, contract):
+                if error_code not in INFO_CODES:
+                    logger.error(f"IBKR Error {error_code}: {error_string}")
+            ib.errorEvent += filter_errors
+        
+        # Suppress stderr from C++ wrapper (ERROR 10090, 2104, etc.)
+        if not verbose:
+            stderr_capture = StringIO()
+            with redirect_stderr(stderr_capture):
+                ib.connect('127.0.0.1', 7496, clientId=client_id, timeout=15, readonly=True)
+                ib.reqMarketDataType(4)
+        else:
+            ib.connect('127.0.0.1', 7496, clientId=client_id, timeout=15, readonly=True)
+            ib.reqMarketDataType(4)
         return ib
     except asyncio.TimeoutError:
         logger.error(f"connect_ib: Connection timeout (clientId={client_id})")
@@ -361,17 +385,18 @@ def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, m
     return []
 
 
-def fetch_option_greeks_batch(ib, options):
+def fetch_option_greeks_batch(ib, options, verbose=False):
     """Batch: subscribe all, wait once, collect all, cancel all. (wie tws_pipeline.py)"""
     if not options:
         return []
 
-    # Subscribe all
-    for opt in options:
-        try:
-            ib.reqMktData(opt, '', False, False)
-        except Exception as e:
-            logger.warning(f"fetch_option_greeks_batch: reqMktData failed for {opt.localSymbol}: {e}")
+    # Subscribe all (suppress stderr for 10090 errors)
+    with suppress_ib_stderr(verbose):
+        for opt in options:
+            try:
+                ib.reqMktData(opt, '', False, False)
+            except Exception as e:
+                logger.warning(f"fetch_option_greeks_batch: reqMktData failed for {opt.localSymbol}: {e}")
 
     # Single wait for all (3s wie in tws_pipeline.py)
     try:
@@ -845,7 +870,7 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
         return False
 
 
-def place_spread_order(ib, short_option, long_option, quantity, order_type, credit_limit_price, auto_transmit=False):
+def place_spread_order(ib, short_option, long_option, quantity, order_type, credit_limit_price, auto_transmit=False, verbose=False):
     """
     Platziert einen Bull Put Spread (Credit Spread):
     - Short Leg: SELL PUT @ higher strike
@@ -890,9 +915,10 @@ def place_spread_order(ib, short_option, long_option, quantity, order_type, cred
     
     try:
         # Market Data für beide Legs anfordern für aktuelle Preise
-        ib.reqMktData(short_option, '', False, False)
-        ib.reqMktData(long_option, '', False, False)
-        ib.sleep(1)
+        with suppress_ib_stderr(verbose):
+            ib.reqMktData(short_option, '', False, False)
+            ib.reqMktData(long_option, '', False, False)
+            ib.sleep(1)
         
         short_ticker = ib.ticker(short_option)
         long_ticker = ib.ticker(long_option)
@@ -964,11 +990,11 @@ def write_master_csv(results, filepath):
     return False
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False, spread_mode=False, spread_width=5, max_margin=1000, min_credit=0.80):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False, spread_mode=False, spread_width=5, max_margin=1000, min_credit=0.80, verbose=False):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
-        ib = connect_ib(client_id)
+        ib = connect_ib(client_id, verbose=verbose)
         if ib is None:
             return {'symbol': symbol, 'error': f'Failed to connect to IBKR (clientId={client_id})'}
 
@@ -1397,31 +1423,16 @@ def main():
     log_level = logging.INFO if verbose else logging.WARNING
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s : %(message)s')
     
-    # Also set ib_insync logger to WARNING to suppress its INFO messages
+    # Aggressively suppress ALL ib_insync loggers when not verbose
     if not verbose:
-        logging.getLogger('ib_insync').setLevel(logging.WARNING)
-        logging.getLogger('ib_insync.ib').setLevel(logging.WARNING)
-        logging.getLogger('ib_insync.client').setLevel(logging.WARNING)
+        for logger_name in ['ib_insync', 'ib_insync.ib', 'ib_insync.client', 'ib_insync.wrapper', 
+                           'ib_insync.contract', 'ib_insync.order', 'ib_insync.ticker', 'ib_insync.util']:
+            lg = logging.getLogger(logger_name)
+            lg.setLevel(logging.CRITICAL)  # Only CRITICAL through
+            lg.propagate = False  # Don't propagate to root logger
     
-    # Configure logging based on verbose flag
-    log_level = logging.INFO if verbose else logging.WARNING
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s : %(message)s')
-    
-    # Also set ib_insync logger to WARNING to suppress its INFO messages
-    if not verbose:
-        logging.getLogger('ib_insync').setLevel(logging.WARNING)
-        logging.getLogger('ib_insync.ib').setLevel(logging.WARNING)
-        logging.getLogger('ib_insync.client').setLevel(logging.WARNING)
-    
-    # Configure logging based on verbose flag
-    log_level = logging.INFO if verbose else logging.WARNING
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s : %(message)s')
-    
-    # Also set ib_insync logger to WARNING to suppress its INFO messages
-    if not verbose:
-        logging.getLogger('ib_insync').setLevel(logging.WARNING)
-        logging.getLogger('ib_insync.ib').setLevel(logging.WARNING)
-        logging.getLogger('ib_insync.client').setLevel(logging.WARNING)
+    # Set script's own logger level
+    logger.setLevel(log_level)
     
     # Configurable output path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1456,7 +1467,8 @@ def main():
                                keep_connected=False, delta_min=delta_min, delta_max=delta_max,
                                num_chains=num_chains, order_type=order_type, bid_min=bid_min,
                                bracket_mode=bracket_mode, spread_mode=spread_mode,
-                               spread_width=spread_width, max_margin=max_margin, min_credit=min_credit)
+                               spread_width=spread_width, max_margin=max_margin, min_credit=min_credit,
+                               verbose=verbose)
         results.append(result)
         
         if 'error' in result:
@@ -1613,7 +1625,7 @@ def main():
                                 placed = place_spread_order(order_ib, short_opt, long_opt,
                                                           quantity=1, order_type=order_type,
                                                           credit_limit_price=selected['credit'],
-                                                          auto_transmit=False)
+                                                          auto_transmit=False, verbose=verbose)
                                 if placed:
                                     print(f"✅ {selected['symbol']} BULL PUT SPREAD erfolgreich platziert!")
                                 else:
@@ -1709,7 +1721,7 @@ def main():
                             placed = place_spread_order(order_ib, short_opt, long_opt,
                                                       quantity=1, order_type=order_type,
                                                       credit_limit_price=best['credit'],
-                                                      auto_transmit=False)
+                                                      auto_transmit=False, verbose=verbose)
                             if placed:
                                 print(f"✅ {symbol} BULL PUT SPREAD erfolgreich platziert!")
                             else:
