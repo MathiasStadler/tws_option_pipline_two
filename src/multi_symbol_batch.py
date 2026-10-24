@@ -985,10 +985,113 @@ def place_spread_order(ib, short_option, long_option, quantity, order_type, cred
         print(f"✅ Bull Put Spread platziert: Short={short_trade.orderStatus.status}, Long={long_trade.orderStatus.status}")
         print(f"   OCA Group: {oca_group} (Type 1: One-Cancels-All)")
         print(f"   Net Credit: ${net_credit:.2f} | Max Risk: ${(short_option.strike - long_option.strike) * 100 - net_credit * 100:.0f}")
-        return True
+        
+        # Return spread info for OCA TP/SL attachment
+        return {
+            'success': True,
+            'net_credit': net_credit,
+            'short_strike': short_option.strike,
+            'long_strike': long_option.strike,
+            'width': short_option.strike - long_option.strike,
+            'expiration': short_option.lastTradeDateOrContractMonth,
+            'symbol': short_option.symbol,
+            'oca_group': oca_group,
+            'short_option': short_option,
+            'long_option': long_option
+        }
         
     except Exception as e:
         handle_ibkr_error("place_spread_order", e, logger)
+        return {'success': False, 'error': str(e)}
+
+
+def place_spread_oca_orders(ib, short_option, long_option, quantity, net_credit, 
+                             take_profit_pct=0.30, stop_loss_pct=2.00, auto_transmit=False, verbose=False):
+    """
+    Platziert OCA Stop-Loss & Take-Profit Orders für einen BEREITS ERÖFFNETEN Bull Put Spread.
+    
+    Verwendet einen BAG/Combo Contract für den gesamten Spread:
+    - Take Profit: BUY Spread @ Limit (Debit = net_credit * take_profit_pct, z.B. 30% = 70% Gewinn)
+    - Stop Loss:   BUY Spread @ STP LMT (Debit = net_credit * stop_loss_pct, z.B. 200% = 100% Verlust)
+    - OCA Group: One-Cancels-All (ocaType=1)
+    
+    Args:
+        take_profit_pct: 0.30 = Buy back at 30% of credit received (70% profit)
+        stop_loss_pct:   2.00 = Buy back at 200% of credit received (100% loss)
+    """
+    from ib_insync import Order, Bag, Leg
+    import uuid
+    
+    # Combo/BAG Contract für den gesamten Spread
+    spread_combo = Bag([
+        Leg(short_option, 1, 'BUY'),   # Buy back short leg
+        Leg(long_option, 1, 'SELL')    # Sell back long leg
+    ], symbol=short_option.symbol, exchange=short_option.exchange)
+    
+    ib.qualifyContracts(spread_combo)
+    
+    # OCA Group für TP/SL
+    oca_group = f"SPREAD_OCA_{short_option.symbol}_{short_option.lastTradeDateOrContractMonth}_{uuid.uuid4().hex[:8]}"
+    
+    # Preise berechnen
+    tp_debit = round(net_credit * take_profit_pct, 2)      # z.B. 1.50 * 0.30 = 0.45
+    sl_debit = round(net_credit * stop_loss_pct, 2)        # z.B. 1.50 * 2.00 = 3.00
+    
+    print(f"\n📊 SPREAD OCA Orders (TP/SL) platzieren:")
+    print(f"   Group: {oca_group}")
+    print(f"   Net Credit erhalten: ${net_credit:.2f}")
+    print(f"   Take Profit: BUY Spread @ ${tp_debit:.2f} LMT ({int((1-take_profit_pct)*100)}% Gewinn)")
+    print(f"   Stop Loss:   BUY Spread @ ${sl_debit:.2f} STP LMT ({int((stop_loss_pct-1)*100)}% Verlust)")
+    print(f"   OCA Type: 1 (One-Cancels-All)")
+    
+    # Take Profit Order: BUY Spread @ Limit (Debit)
+    tp_order = Order()
+    tp_order.action = 'BUY'
+    tp_order.orderType = 'LMT'
+    tp_order.totalQuantity = quantity
+    tp_order.lmtPrice = tp_debit
+    tp_order.tif = 'DAY'
+    tp_order.transmit = False
+    tp_order.ocaGroup = oca_group
+    tp_order.ocaType = 1  # Cancel all when one fills
+    
+    # Stop Loss Order: BUY Spread @ Stop-Limit (Debit)
+    sl_order = Order()
+    sl_order.action = 'BUY'
+    sl_order.orderType = 'STP LMT'
+    sl_order.totalQuantity = quantity
+    sl_order.lmtPrice = round(sl_debit + 0.05, 2)  # Limit etwas über Stop für Fill-Sicherheit
+    sl_order.auxPrice = sl_debit                    # Stop Trigger Price
+    sl_order.tif = 'DAY'
+    sl_order.transmit = False
+    sl_order.ocaGroup = oca_group
+    sl_order.ocaType = 1
+    
+    try:
+        # Market Data für Combo anfordern
+        with suppress_ib_stderr(verbose):
+            ib.reqMktData(spread_combo, '', False, False)
+            ib.sleep(1)
+        
+        combo_ticker = ib.ticker(spread_combo)
+        if combo_ticker:
+            print(f"   Combo Mark: Bid={combo_ticker.bid}, Ask={combo_ticker.ask}")
+        ib.cancelMktData(spread_combo)
+        
+        # Place both OCA orders (last transmits)
+        tp_trade = ib.placeOrder(spread_combo, tp_order)
+        sl_order.transmit = True
+        sl_trade = ib.placeOrder(spread_combo, sl_order)
+        
+        ib.sleep(1)
+        
+        logger.info(f"Spread OCA platziert: TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}, Group={oca_group}")
+        print(f"✅ Spread OCA platziert: TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        print(f"   OCA Group: {oca_group} (Type 1: One-Cancels-All)")
+        return True
+        
+    except Exception as e:
+        handle_ibkr_error("place_spread_oca_orders", e, logger)
         return False
 
 
@@ -1653,7 +1756,21 @@ def main():
                                                           quantity=1, order_type=order_type,
                                                           credit_limit_price=selected['credit'],
                                                           auto_transmit=False, verbose=verbose)
-                                if placed:
+                                if placed and isinstance(placed, dict) and placed.get('success'):
+                                    print(f"✅ {selected['symbol']} BULL PUT SPREAD erfolgreich platziert!")
+                                    # Attach OCA TP/SL orders
+                                    print(f"\n>>> OCA Stop-Loss / Take-Profit für Spread anhängen?")
+                                    print(f"   Standard: TP 70% (${selected['credit'] * 0.30:.2f}) / SL 100% (${selected['credit'] * 2.00:.2f})")
+                                    try:
+                                        oca_choice = input("   OCA anhängen? (y/n): ").strip().lower()
+                                        if oca_choice in ['y', 'yes', 'j', 'ja']:
+                                            place_spread_oca_orders(order_ib, short_opt, long_opt,
+                                                                   quantity=1, net_credit=placed['net_credit'],
+                                                                   take_profit_pct=0.30, stop_loss_pct=2.00,
+                                                                   verbose=verbose)
+                                    except (EOFError, KeyboardInterrupt):
+                                        pass
+                                elif placed:
                                     print(f"✅ {selected['symbol']} BULL PUT SPREAD erfolgreich platziert!")
                                 else:
                                     print(f"❌ {selected['symbol']} Spread Order nicht platziert.")
@@ -1752,7 +1869,15 @@ def main():
                                                       quantity=1, order_type=order_type,
                                                       credit_limit_price=best['credit'],
                                                       auto_transmit=False, verbose=verbose)
-                            if placed:
+                            if placed and isinstance(placed, dict) and placed.get('success'):
+                                print(f"✅ {symbol} BULL PUT SPREAD erfolgreich platziert!")
+                                # Auto-attach OCA TP/SL
+                                print(f"\n>>> Auto-anhängen: OCA Stop-Loss / Take-Profit")
+                                place_spread_oca_orders(order_ib, short_opt, long_opt,
+                                                       quantity=1, net_credit=placed['net_credit'],
+                                                       take_profit_pct=0.30, stop_loss_pct=2.00,
+                                                       verbose=verbose)
+                            elif placed:
                                 print(f"✅ {symbol} BULL PUT SPREAD erfolgreich platziert!")
                             else:
                                 print(f"❌ {symbol} Spread Order nicht platziert.")
