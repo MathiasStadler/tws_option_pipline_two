@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Multi-Symbol Batch Pipeline: Sequentiell mit IBKR (kein Threading-Problem)
-# Usage: python3 multi_symbol_batch.py [SYMBOLS...] [MONTH_INDICES...] [EXCHANGE] [CURRENCY]
+# Usage: python3 multi_symbol_batch.py [SYMBOLS...] [MONTH_INDICES...] [OPTIONS]
 
 import sys
 import csv
@@ -14,6 +14,10 @@ from datetime import datetime
 from pathlib import Path
 from contextlib import redirect_stderr, contextmanager
 from io import StringIO
+import argparse
+
+# Local config
+from config import get_settings, Settings
 
 @contextmanager
 def suppress_ib_stderr(verbose):
