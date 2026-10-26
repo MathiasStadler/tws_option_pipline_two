@@ -1584,7 +1584,8 @@ def main():
     
     results = []
     # Use unique client IDs based on PID to avoid conflicts
-    base_client_id = (os.getpid() % 1000) * 1000
+    #base_client_id = (os.getpid() % 1000) * 1000
+    base_client_id=1
     for i, symbol in enumerate(symbols):
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing {symbol} ({i+1}/{len(symbols)})...")

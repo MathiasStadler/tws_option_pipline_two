@@ -188,3 +188,5 @@ Short | Long | W  | Exp       | Credit | Margin | ROM% | POP% | Short Δ
 
 **Stand:** Implementiert in `multi_symbol_batch.py` (Lines ~898-1100)  
 **Testen:** `python3 multi_symbol_batch.py AAPL --spread -m`
+
+python3 multi_spread_oca.py PLTR --spread  --max-margin 1000 --min-credit 0.80
