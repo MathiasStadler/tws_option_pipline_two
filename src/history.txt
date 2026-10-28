@@ -7,3 +7,4 @@ python3 multi_symbol_batch.py ZIM  --chains 3  --spread --spread-width 5 --max-m
 
 # weiter funzt
 python3 multi_symbol_batch.py crox  -m --chains 3  --spread --spread-width 5 --max-margin 1000 --dmin -0.50  --dmax -0.01 --bid-min 0.01 0 1 SMART USD
+
