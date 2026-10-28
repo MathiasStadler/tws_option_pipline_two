@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Multi-Symbol Batch Pipeline: Sequentiell mit IBKR (kein Threading-Problem)
-# Usage: python3 multi_symbol_batch.py [SYMBOLS...] [MONTH_INDICES...] [EXCHANGE] [CURRENCY]
+# Usage: python3 multi_symbol_batch.py [SYMBOLS...] [MONTH_INDICES...] [OPTIONS]
 
 # human change
 import sys
@@ -13,6 +13,17 @@ import socket
 import os
 from datetime import datetime
 from pathlib import Path
+from contextlib import redirect_stderr, contextmanager
+from io import StringIO
+import argparse
+
+# Local config
+from config import get_settings, Settings
+
+@contextmanager
+def suppress_ib_stderr(verbose):
+    """No-op when using logging suppression."""
+    yield
 
 try:
     from ib_insync import IB, Stock, Option, RequestError, FlexError
@@ -38,7 +49,7 @@ except ImportError as exc:  # pragma: no cover - optional dependency at runtime
     class FlexError(ImportError):
         pass
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s : %(message)s')
+# Logging will be configured in main() after argument parsing
 logger = logging.getLogger(__name__)
 
 
@@ -202,14 +213,16 @@ def estimate_atm_iv(chain, stock_price):
         return 0.3
 
 def get_strike_range_for_delta(chain, stock_price, expiration, min_delta=-0.50, max_delta=-0.10, r=0.05):
+    """Returns list of strikes with BS delta in range, not just min/max.
+    This avoids requesting market data for strikes that won't have quotes."""
     try:
         exp_date = datetime.strptime(expiration, '%Y%m%d')
         T = (exp_date - datetime.now()).days / 365.0
         if T <= 0:
-            return None, None
+            return []
     except Exception as e:
         logger.warning(f"get_strike_range_for_delta: Date parse error - {type(e).__name__}: {e}")
-        return None, None
+        return []
 
     try:
         sigma = estimate_atm_iv(chain, stock_price)
@@ -222,18 +235,38 @@ def get_strike_range_for_delta(chain, stock_price, expiration, min_delta=-0.50, 
                 valid_strikes.append(strike)
 
         if not valid_strikes:
-            return None, None
-        return min(valid_strikes), max(valid_strikes)
+            logger.warning(f"  No strikes in delta range {min_delta} to {max_delta}")
+            return []
+        
+        logger.info(f"  Delta-filtered strikes: {valid_strikes}")
+        return valid_strikes
     except Exception as e:
         handle_ibkr_error("get_strike_range_for_delta", e, logger)
-        return None, None
+        return []
 
 
-def connect_ib(client_id):
+def connect_ib(client_id, verbose=False):
     try:
         ib = IB()
-        ib.connect('127.0.0.1', 7496, clientId=client_id, timeout=15, readonly=True)
-        ib.reqMarketDataType(4)
+        
+        # Custom error handler to filter informational codes
+        if not verbose:
+            # Informational codes that don't need to be shown
+            INFO_CODES = {10090, 10167, 2104, 2106, 2158, 2103, 2105, 2107, 2157}
+            def filter_errors(req_id, error_code, error_string, contract):
+                if error_code not in INFO_CODES:
+                    logger.error(f"IBKR Error {error_code}: {error_string}")
+            ib.errorEvent += filter_errors
+        
+        # Suppress stderr from C++ wrapper (ERROR 10090, 2104, etc.)
+        if not verbose:
+            stderr_capture = StringIO()
+            with redirect_stderr(stderr_capture):
+                ib.connect('127.0.0.1', 7496, clientId=client_id, timeout=15, readonly=True)
+                ib.reqMarketDataType(4)
+        else:
+            ib.connect('127.0.0.1', 7496, clientId=client_id, timeout=15, readonly=True)
+            ib.reqMarketDataType(4)
         return ib
     except asyncio.TimeoutError:
         logger.error(f"connect_ib: Connection timeout (clientId={client_id})")
@@ -295,12 +328,12 @@ def get_stock_data(ib, stock, timeout: float = 5.0):
                 ib.sleep(0.5)
             except Exception as e:
                 logger.warning(f"get_stock_data: sleep interrupted - {e}")
-            # Check if we have meaningful data
-            if ticker.last is not None or ticker.close is not None or (ticker.bid and ticker.ask):
+            # Check if we have meaningful data (last > 0, not just != None since IB returns -1.0 as placeholder)
+            if (ticker.last is not None and ticker.last > 0) or ticker.close is not None or (ticker.bid is not None and ticker.ask is not None):
                 break
         data = {
             'conid': stock.conId, 'symbol': stock.symbol,
-            'bid': ticker.bid, 'ask': ticker.ask, 'last': ticker.last,
+            'bid': ticker.bid, 'ask': ticker.ask, 'last': ticker.last if ticker.last and ticker.last > 0 else None,
             'close': ticker.close, 'volume': ticker.volume,
             'high': ticker.high, 'low': ticker.low,
         }
@@ -316,14 +349,34 @@ def get_stock_data(ib, stock, timeout: float = 5.0):
     return None
 
 
-def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike):
+def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike, stock_price=None, valid_strikes=None):
     try:
         options = []
-        for strike in chain.strikes:
+        # If valid_strikes provided, use those directly (from BS delta filter)
+        # Otherwise iterate all chain.strikes with min/max/moneyness filters
+        strikes_to_use = valid_strikes if valid_strikes is not None else chain.strikes
+        
+        # Filter: nur 5-Punkt-Strikes (liquide US-Standard), keine 2.5-Punkt (existieren oft nicht)
+        strikes_to_use = [s for s in strikes_to_use if abs(s % 5) < 0.01]
+        
+        # Begrenzen auf max 5 liquideste Strikes (nahe ATM) für Paper Delayed Data
+        # Sortiere nach Moneyness (näher an 1.0 = ATM)
+        if stock_price is not None and len(strikes_to_use) > 5:
+            strikes_to_use.sort(key=lambda s: abs(s / stock_price - 1.0))
+            strikes_to_use = strikes_to_use[:5]
+            logger.info(f"  Limited to top 5 ATM strikes for market data: {strikes_to_use}")
+        
+        for strike in strikes_to_use:
             if min_strike is not None and strike < min_strike:
                 continue
             if max_strike is not None and strike > max_strike:
                 continue
+            # Filter: nur Strikes in sinnvollem Moneyness-Bereich (70%-130% von Spot)
+            # Paper Delayed Data liefert nur für liquide Strikes nahe ATM Bids
+            if stock_price is not None:
+                moneyness = strike / stock_price
+                if moneyness < 0.70 or moneyness > 1.30:
+                    continue
             opt = Option(symbol, expiration, strike, 'P', exchange, tradingClass=chain.tradingClass, multiplier=chain.multiplier)
             options.append(opt)
 
@@ -337,17 +390,20 @@ def get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, m
     return []
 
 
-def fetch_option_greeks_batch(ib, options):
+def fetch_option_greeks_batch(ib, options, verbose=False):
+    """Batch: subscribe all, wait once, collect all, cancel all. (wie tws_pipeline.py)"""
     if not options:
         return []
 
-    # Request market data for all
-    for opt in options:
-        try:
-            ib.reqMktData(opt, '', False, False)
-        except Exception as e:
-            logger.warning(f"fetch_option_greeks_batch: reqMktData failed for {opt.localSymbol}: {e}")
+    # Subscribe all (suppress stderr for 10090 errors)
+    with suppress_ib_stderr(verbose):
+        for opt in options:
+            try:
+                ib.reqMktData(opt, '', False, False)
+            except Exception as e:
+                logger.warning(f"fetch_option_greeks_batch: reqMktData failed for {opt.localSymbol}: {e}")
 
+    # Single wait for all (3s wie in tws_pipeline.py)
     try:
         ib.sleep(3)
     except Exception as e:
@@ -417,7 +473,7 @@ def check_margin(ib, option, quantity=1, price=None):
     # WhatIf Order für Margin-Check
     test_order = Order()
     test_order.action = 'SELL'
-    test_order.orderType = 'LMT'
+    test_order.orderType = order_type
     test_order.totalQuantity = quantity
     test_order.lmtPrice = round(price, 2) if price else 0
     test_order.tif = 'DAY'
@@ -467,10 +523,35 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
     try:
         from ib_insync import Order
 
-        # Für REL Orders (Pegged-to-Midpoint): kein Limit-Preis, auxPrice=0 für Midpoint
+        # Für REL/MKT Orders: kein Limit-Preis
         if order_type == 'REL':
             order_type = 'REL'
             limit_price = None  # REL orders haben keinen Limit-Preis
+        elif order_type == 'MKT':
+            order_type = 'MKT'
+            limit_price = None  # MKT orders haben keinen Limit-Preis
+            # Für Margin-Check und Bracket: Preis holen
+            try:
+                ib.reqMktData(option, '', False, False)
+                try:
+                    ib.sleep(2)
+                except Exception as e:
+                    logger.warning(f"place_option_order: sleep interrupted - {e}")
+            except RequestError as e:
+                logger.error(f"place_option_order: reqMktData failed - {e}")
+                return False
+            
+            ticker = ib.ticker(option)
+            if ticker is None or ticker.bid is None or ticker.bid <= 0:
+                logger.warning(f"Kein gültiger Preis für {option.localSymbol}")
+                return False
+            
+            # Für MKT: bid für SELL, ask für BUY als Referenz
+            check_price = ticker.bid if action == 'SELL' else ticker.ask
+            try:
+                ib.cancelMktData(option)
+            except Exception:
+                pass
         else:
             order_type = 'LMT'
             if limit_price is None:
@@ -502,7 +583,6 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
 
         # MARGIN CHECK vor Auto-Order
         # Für REL Orders: Margin basierend auf Mid-Preis prüfen
-        check_price = limit_price
         if order_type == 'REL' and check_price is None:
             # Mid-Preis für Margin-Check holen
             try:
@@ -604,8 +684,8 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                 print(f"LimitPrice: ${limit_price:.2f}")
             elif order_type == 'REL':
                 print(f"LimitPrice: REL (Pegged-to-Midpoint, Offset=0)")
-            else:
-                print(f"LimitPrice: MID (Market Mid-Price)")
+            elif order_type == 'MKT':
+                print(f"Type:       Market Order (no limit price)")
             print(f"Contract:   {option.localSymbol}")
             
             # Margin Check für Short PUT
@@ -623,9 +703,10 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
                     from ib_insync import Order
                     test_order = Order()
                     test_order.action = 'SELL'
-                    test_order.orderType = 'LMT'
+                    test_order.orderType = order_type
                     test_order.totalQuantity = quantity
-                    test_order.lmtPrice = round(limit_price, 2) if limit_price else 0
+                    if order_type == 'LMT' and limit_price:
+                        test_order.lmtPrice = round(limit_price, 2)
                     test_order.tif = 'DAY'
                     test_order.whatIf = True
                     
@@ -693,14 +774,14 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
             
             while True:
                 try:
-                                        confirm = input("Order platzieren? (y/n): ").strip().lower()
+                    confirm = input("Order platzieren? (y/n): ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     logger.info("place_option_order: User cancelled input")
                     try:
                         ib.cancelOrder(trade.order)
                     except Exception:
                         pass
-                        return False
+                    return False
                 if confirm in ['y', 'yes', 'j', 'ja']:
                     try:
                         trade.transmit = True
@@ -737,12 +818,17 @@ def place_option_order(ib, option, action='SELL', quantity=1, order_type='LMT', 
 
 def place_bracket_order(ib, option, quantity, order_type, limit_price, take_profit_price, stop_loss_price, auto_transmit=False):
     """
-    Erstellt eine Bracket Order für Short PUT:
+    Erstellt eine OCA Group Order für Short PUT:
     - Parent: SELL PUT @ limit_price (oder REL)
     - Take Profit: BUY @ take_profit_price (30% of premium = 70% profit)
     - Stop Loss: BUY @ stop_loss_price (200% of premium = 100% loss)
+    OCA Group: One-Cancels-All (ocaType=1)
     """
     from ib_insync import Order
+    import uuid
+    
+    # Eindeutige OCA Group ID
+    oca_group = f"OCA_{option.symbol}_{option.lastTradeDateOrContractMonth}_{uuid.uuid4().hex[:8]}"
     
     # Parent Order (SELL PUT)
     parent = Order()
@@ -750,16 +836,16 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     parent.orderType = order_type
     parent.totalQuantity = quantity
     parent.tif = 'DAY'
-    parent.transmit = False  # Don't transmit yet
+    parent.transmit = False
     
     if order_type == 'LMT':
         parent.lmtPrice = round(limit_price, 2)
     elif order_type == 'REL':
         parent.auxPrice = 0  # Midpoint
     
-    # Generate parent order ID
-    parent_id = ib.client.getReqId()
-    parent.orderId = parent_id
+    # OCA Group für Parent
+    parent.ocaGroup = oca_group
+    parent.ocaType = 1  # 1 = Cancel all remaining when one fills
     
     # Take Profit Order (BUY back at 30% of premium)
     tp_order = Order()
@@ -768,8 +854,9 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     tp_order.totalQuantity = quantity
     tp_order.lmtPrice = take_profit_price
     tp_order.tif = 'DAY'
-    tp_order.parentId = parent_id
     tp_order.transmit = False
+    tp_order.ocaGroup = oca_group
+    tp_order.ocaType = 1
     
     # Stop Loss Order (BUY back at 200% of premium)
     sl_order = Order()
@@ -778,34 +865,238 @@ def place_bracket_order(ib, option, quantity, order_type, limit_price, take_prof
     sl_order.totalQuantity = quantity
     sl_order.auxPrice = stop_loss_price  # Stop price
     sl_order.tif = 'DAY'
-    sl_order.parentId = parent_id
-    sl_order.transmit = True  # Last order transmits all
+    sl_order.transmit = False
+    sl_order.ocaGroup = oca_group
+    sl_order.ocaType = 1
     
     # Place all three orders
-    print(f"📊 Bracket Order platzieren:")
+    print(f"📊 OCA Group Order platzieren:")
+    print(f"   Group: {oca_group}")
     print(f"   Parent: SELL {quantity} {option.localSymbol} @ {order_type} {limit_price if limit_price else 'REL'}")
     print(f"   Take Profit: BUY {quantity} @ ${take_profit_price:.2f} LMT (70% profit)")
     print(f"   Stop Loss: BUY {quantity} @ ${stop_loss_price:.2f} STP (100% loss)")
+    print(f"   OCA Type: 1 (One-Cancels-All)")
     
     try:
-        # Place parent first
+        # Place all three orders rapidly (no sleep between)
+        # Only the LAST order transmits = all 3 sent atomar
         parent_trade = ib.placeOrder(option, parent)
-        ib.sleep(0.5)
-        
-        # Place take profit
         tp_trade = ib.placeOrder(option, tp_order)
-        ib.sleep(0.5)
         
-        # Place stop loss (transmits all)
+        # Last order transmits all
+        sl_order.transmit = True
         sl_trade = ib.placeOrder(option, sl_order)
+        
+        # Brief wait for confirmation
         ib.sleep(1)
         
-        logger.info(f"Bracket Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
-        print(f"✅ Bracket Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        logger.info(f"OCA Group Order platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}, Group={oca_group}")
+        print(f"✅ OCA Group platziert: Parent={parent_trade.orderStatus.status}, TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        print(f"   OCA Group: {oca_group} (Type 1: One-Cancels-All)")
         return True
         
     except Exception as e:
         handle_ibkr_error("place_bracket_order", e, logger)
+        return False
+
+
+def place_spread_order(ib, short_option, long_option, quantity, order_type, credit_limit_price, auto_transmit=False, verbose=False):
+    """
+    Platziert einen Bull Put Spread (Credit Spread):
+    - Short Leg: SELL PUT @ higher strike
+    - Long Leg:  BUY PUT @ lower strike
+    OCA Group für beide Legs (One-Cancels-All)
+    """
+    from ib_insync import Order
+    import uuid
+    
+    # OCA Group für beide Legs
+    oca_group = f"SPREAD_{short_option.symbol}_{short_option.lastTradeDateOrContractMonth}_{uuid.uuid4().hex[:8]}"
+    
+    # Short Leg (SELL Higher Strike PUT)
+    short_order = Order()
+    short_order.action = 'SELL'
+    short_order.orderType = order_type
+    short_order.totalQuantity = quantity
+    short_order.tif = 'DAY'
+    short_order.transmit = False
+    short_order.ocaGroup = oca_group
+    short_order.ocaType = 1
+    
+    # Long Leg (BUY Lower Strike PUT)
+    long_order = Order()
+    long_order.action = 'BUY'
+    long_order.orderType = order_type
+    long_order.totalQuantity = quantity
+    long_order.tif = 'DAY'
+    long_order.transmit = False
+    long_order.ocaGroup = oca_group
+    long_order.ocaType = 1
+    
+    # Est. Credit für Display
+    est_credit = (short_option.bid if hasattr(short_option, 'bid') and short_option.bid else 0) -                  (long_option.ask if hasattr(long_option, 'ask') and long_option.ask else 0)
+    
+    print(f"📊 BULL PUT SPREAD Order platzieren:")
+    print(f"   Group: {oca_group}")
+    print(f"   Short: SELL {quantity} {short_option.localSymbol} @ {order_type}")
+    print(f"   Long:  BUY  {quantity} {long_option.localSymbol} @ {order_type}")
+    print(f"   Est. Credit: ${est_credit:.2f} | Width: ${short_option.strike - long_option.strike:.0f}")
+    print(f"   OCA Type: 1 (One-Cancels-All)")
+    
+    try:
+        # Market Data für beide Legs anfordern für aktuelle Preise
+        with suppress_ib_stderr(verbose):
+            ib.reqMktData(short_option, '', False, False)
+            ib.reqMktData(long_option, '', False, False)
+            ib.sleep(1)
+        
+        short_ticker = ib.ticker(short_option)
+        long_ticker = ib.ticker(long_option)
+        
+        short_bid = short_ticker.bid if short_ticker and short_ticker.bid else 0
+        short_ask = short_ticker.ask if short_ticker and short_ticker.ask else 0
+        long_bid = long_ticker.bid if long_ticker and long_ticker.bid else 0
+        long_ask = long_ticker.ask if long_ticker and long_ticker.ask else 0
+        
+        ib.cancelMktData(short_option)
+        ib.cancelMktData(long_option)
+        
+        if short_bid <= 0 or long_ask <= 0:
+            print(f"❌ Keine gültigen Preise: Short Bid={short_bid}, Long Ask={long_ask}")
+            return False
+        
+        # Orders mit aktuellen Preisen aktualisieren
+        if order_type == 'LMT':
+            short_order.lmtPrice = round(short_bid, 2)
+            long_order.lmtPrice = round(long_ask, 2)
+        elif order_type == 'MKT':
+            pass  # Market orders
+        
+        net_credit = short_bid - long_ask
+        if net_credit <= 0:
+            print(f"❌ Kein Credit Spread möglich: Short Bid={short_bid}, Long Ask={long_ask}")
+            return False
+        
+        print(f"   Live Credit: ${net_credit:.2f} (Short Bid ${short_bid:.2f} - Long Ask ${long_ask:.2f})")
+        
+        # Place both orders (last transmits)
+        short_trade = ib.placeOrder(short_option, short_order)
+        long_order.transmit = True
+        long_trade = ib.placeOrder(long_option, long_order)
+        
+        ib.sleep(1)
+        
+        logger.info(f"Bull Put Spread platziert: Short={short_trade.orderStatus.status}, Long={long_trade.orderStatus.status}, Group={oca_group}")
+        print(f"✅ Bull Put Spread platziert: Short={short_trade.orderStatus.status}, Long={long_trade.orderStatus.status}")
+        print(f"   OCA Group: {oca_group} (Type 1: One-Cancels-All)")
+        print(f"   Net Credit: ${net_credit:.2f} | Max Risk: ${(short_option.strike - long_option.strike) * 100 - net_credit * 100:.0f}")
+        
+        # Return spread info for OCA TP/SL attachment
+        return {
+            'success': True,
+            'net_credit': net_credit,
+            'short_strike': short_option.strike,
+            'long_strike': long_option.strike,
+            'width': short_option.strike - long_option.strike,
+            'expiration': short_option.lastTradeDateOrContractMonth,
+            'symbol': short_option.symbol,
+            'oca_group': oca_group,
+            'short_option': short_option,
+            'long_option': long_option
+        }
+        
+    except Exception as e:
+        handle_ibkr_error("place_spread_order", e, logger)
+        return {'success': False, 'error': str(e)}
+
+
+def place_spread_oca_orders(ib, short_option, long_option, quantity, net_credit, 
+                             take_profit_pct=0.30, stop_loss_pct=2.00, auto_transmit=False, verbose=False):
+    """
+    Platziert OCA Stop-Loss & Take-Profit Orders für einen BEREITS ERÖFFNETEN Bull Put Spread.
+    
+    Verwendet einen BAG/Combo Contract für den gesamten Spread:
+    - Take Profit: BUY Spread @ Limit (Debit = net_credit * take_profit_pct, z.B. 30% = 70% Gewinn)
+    - Stop Loss:   BUY Spread @ STP LMT (Debit = net_credit * stop_loss_pct, z.B. 200% = 100% Verlust)
+    - OCA Group: One-Cancels-All (ocaType=1)
+    
+    Args:
+        take_profit_pct: 0.30 = Buy back at 30% of credit received (70% profit)
+        stop_loss_pct:   2.00 = Buy back at 200% of credit received (100% loss)
+    """
+    from ib_insync import Order, Bag, Leg
+    import uuid
+    
+    # Combo/BAG Contract für den gesamten Spread
+    spread_combo = Bag([
+        Leg(short_option, 1, 'BUY'),   # Buy back short leg
+        Leg(long_option, 1, 'SELL')    # Sell back long leg
+    ], symbol=short_option.symbol, exchange=short_option.exchange)
+    
+    ib.qualifyContracts(spread_combo)
+    
+    # OCA Group für TP/SL
+    oca_group = f"SPREAD_OCA_{short_option.symbol}_{short_option.lastTradeDateOrContractMonth}_{uuid.uuid4().hex[:8]}"
+    
+    # Preise berechnen
+    tp_debit = round(net_credit * take_profit_pct, 2)      # z.B. 1.50 * 0.30 = 0.45
+    sl_debit = round(net_credit * stop_loss_pct, 2)        # z.B. 1.50 * 2.00 = 3.00
+    
+    print(f"\n📊 SPREAD OCA Orders (TP/SL) platzieren:")
+    print(f"   Group: {oca_group}")
+    print(f"   Net Credit erhalten: ${net_credit:.2f}")
+    print(f"   Take Profit: BUY Spread @ ${tp_debit:.2f} LMT ({int((1-take_profit_pct)*100)}% Gewinn)")
+    print(f"   Stop Loss:   BUY Spread @ ${sl_debit:.2f} STP LMT ({int((stop_loss_pct-1)*100)}% Verlust)")
+    print(f"   OCA Type: 1 (One-Cancels-All)")
+    
+    # Take Profit Order: BUY Spread @ Limit (Debit)
+    tp_order = Order()
+    tp_order.action = 'BUY'
+    tp_order.orderType = 'LMT'
+    tp_order.totalQuantity = quantity
+    tp_order.lmtPrice = tp_debit
+    tp_order.tif = 'DAY'
+    tp_order.transmit = False
+    tp_order.ocaGroup = oca_group
+    tp_order.ocaType = 1  # Cancel all when one fills
+    
+    # Stop Loss Order: BUY Spread @ Stop-Limit (Debit)
+    sl_order = Order()
+    sl_order.action = 'BUY'
+    sl_order.orderType = 'STP LMT'
+    sl_order.totalQuantity = quantity
+    sl_order.lmtPrice = round(sl_debit + 0.05, 2)  # Limit etwas über Stop für Fill-Sicherheit
+    sl_order.auxPrice = sl_debit                    # Stop Trigger Price
+    sl_order.tif = 'DAY'
+    sl_order.transmit = False
+    sl_order.ocaGroup = oca_group
+    sl_order.ocaType = 1
+    
+    try:
+        # Market Data für Combo anfordern
+        with suppress_ib_stderr(verbose):
+            ib.reqMktData(spread_combo, '', False, False)
+            ib.sleep(1)
+        
+        combo_ticker = ib.ticker(spread_combo)
+        if combo_ticker:
+            print(f"   Combo Mark: Bid={combo_ticker.bid}, Ask={combo_ticker.ask}")
+        ib.cancelMktData(spread_combo)
+        
+        # Place both OCA orders (last transmits)
+        tp_trade = ib.placeOrder(spread_combo, tp_order)
+        sl_order.transmit = True
+        sl_trade = ib.placeOrder(spread_combo, sl_order)
+        
+        ib.sleep(1)
+        
+        logger.info(f"Spread OCA platziert: TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}, Group={oca_group}")
+        print(f"✅ Spread OCA platziert: TP={tp_trade.orderStatus.status}, SL={sl_trade.orderStatus.status}")
+        print(f"   OCA Group: {oca_group} (Type 1: One-Cancels-All)")
+        return True
+        
+    except Exception as e:
+        handle_ibkr_error("place_spread_oca_orders", e, logger)
         return False
 
 
@@ -834,13 +1125,17 @@ def write_master_csv(results, filepath):
     return False
 
 
-def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False):
+def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_connected=False, delta_min=-0.50, delta_max=-0.10, num_chains=0, order_type='LMT', bid_min=0.80, bracket_mode=False, spread_mode=False, spread_width=5, max_margin=1000, min_credit=0.80, verbose=False):
     """Verarbeitet ein einzelnes Symbol"""
     ib = None
     try:
-        ib = connect_ib(client_id)
+        ib = connect_ib(client_id, verbose=verbose)
         if ib is None:
             return {'symbol': symbol, 'error': f'Failed to connect to IBKR (clientId={client_id})'}
+
+        # Paper Account: Delayed-Frozen Market Data (Type 4) aktivieren
+        ib.reqMarketDataType(4)
+        logger.info("Market data type set to 4 (delayed-frozen)")
 
         stock, chain, _ = get_stock_and_chain(ib, symbol, month_indices[0], exchange, currency)
         if stock is None:
@@ -884,17 +1179,19 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
 
                 stock_price = stock_data['last'] or stock_data['close']
 
-                min_strike, max_strike = get_strike_range_for_delta(chain, stock_price, expiration, min_delta=delta_min, max_delta=delta_max)
-                if min_strike is None:
+                valid_strikes = get_strike_range_for_delta(chain, stock_price, expiration, min_delta=delta_min, max_delta=delta_max)
+                if not valid_strikes:
                     logger.warning(f"  {symbol} {expiration}: Keine Strikes im Delta-Bereich")
                     continue
 
-                options = get_valid_put_options(ib, symbol, expiration, chain, exchange, min_strike, max_strike)
+                options = get_valid_put_options(ib, symbol, expiration, chain, exchange, min(valid_strikes), max(valid_strikes), stock_price=stock_price, valid_strikes=valid_strikes)
                 if not options:
                     continue
 
                 rows = fetch_option_greeks_batch(ib, options)
+                logger.info(f"fetch_option_greeks_batch: {len(rows)} options returned, sample: {rows[:2] if rows else 'empty'}")
                 filtered = filter_by_delta(rows, min_delta=delta_min, max_delta=delta_max)
+                logger.info(f"filter_by_delta: {len(filtered)} options in delta range [{delta_min}, {delta_max}]")
                 
                 # Filter by minimum bid and max 28 days to expiration
                 from datetime import datetime
@@ -902,17 +1199,19 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
                 bid_filtered = []
                 for r in filtered:
                     bid = r.get('bid')
+                    logger.debug(f"Option {r.get('symbol')} {r.get('strike')} {r.get('expiration')}: bid={bid}, delta={r.get('delta')}")
                     if bid is not None and bid >= bid_min:
-                        # Check DTE <= 28
+                        # Check DTE <= 45 (erhöht von 28 für Monthly Options)
                         exp_str = r.get('expiration', '')
                         try:
                             exp_date = datetime.strptime(exp_str, '%Y%m%d')
                             dte = (exp_date - now).days
-                            if dte <= 28:
+                            if dte <= 45:
                                 bid_filtered.append(r)
                         except:
                             bid_filtered.append(r)  # If parsing fails, keep it
                 filtered = bid_filtered
+                logger.info(f"bid_min filter (>= {bid_min}): {len(filtered)} options remaining")
                 
                 for r in filtered:
                     r['expiration'] = expiration
@@ -928,18 +1227,132 @@ def process_symbol(symbol, month_indices, exchange, currency, client_id, keep_co
             except Exception as e:
                 logger.warning(f"  {symbol} {expiration} failed: {e}")
 
-        # Top 5 nach put_profit
-        all_rows.sort(key=lambda x: x.get('put_profit', 0), reverse=True)
-        top5 = all_rows[:5]
+        # ============================================================
+        # BULL PUT SPREAD LOGIC (if spread_mode enabled)
+        # ============================================================
+        spread_rows = []
+        if spread_mode and all_rows:
+            logger.info(f"  {symbol} {expiration}: Searching Bull Put Spreads (width={spread_width}, max_margin=${max_margin})")
+            
+            # Group by expiration
+            by_exp = {}
+            for r in all_rows:
+                exp = r.get('expiration')
+                if exp not in by_exp:
+                    by_exp[exp] = []
+                by_exp[exp].append(r)
+            
+            for exp, options in by_exp.items():
+                # Sort by strike
+                options.sort(key=lambda x: x.get('strike', 0))
+                
+                # Find spread pairs: Short higher strike, Long lower strike
+                for i, short_opt in enumerate(options):
+                    short_strike = short_opt.get('strike')
+                    short_bid = short_opt.get('bid')
+                    short_delta = short_opt.get('delta')
+                    
+                    if short_bid is None or short_bid <= 0 or short_delta is None:
+                        continue
+                    
+                    # Target short delta range
+                    if not (delta_min <= short_delta <= delta_max):
+                        continue
+                    
+                    # Find long leg: lower strike by spread_width
+                    target_long_strike = short_strike - spread_width
+                    long_opt = None
+                    for opt in options:
+                        if abs(opt.get('strike', 0) - target_long_strike) < 0.01:
+                            long_opt = opt
+                            break
+                    
+                    if long_opt is None:
+                        continue
+                    
+                    long_ask = long_opt.get('ask')
+                    long_bid = long_opt.get('bid')
+                    long_delta = long_opt.get('delta')
+                    
+                    if long_ask is None or long_ask <= 0:
+                        continue
+                    
+                    # Calculate spread metrics
+                    credit = short_bid - long_ask  # Net credit received
+                    if credit <= 0:
+                        continue  # Not a valid credit spread
+                    
+                    if credit < min_credit:
+                        continue  # Credit below minimum target
+                    
+                    spread_width_actual = short_strike - long_opt.get('strike', 0)
+                    max_loss = spread_width_actual * 100 - credit * 100  # Max loss per spread
+                    margin_req = max_loss  # Margin for credit spread = max loss
+                    
+                    if margin_req > max_margin:
+                        continue  # Exceeds max margin
+                    
+                    # Return on margin
+                    rom = (credit * 100) / margin_req * 100 if margin_req > 0 else 0
+                    
+                    # Probability of profit (approx: 1 - abs(short_delta))
+                    pop = (1 - abs(short_delta)) * 100 if short_delta else 0
+                    
+                    spread_row = {
+                        'symbol': short_opt.get('symbol'),
+                        'expiration': exp,
+                        'short_strike': short_strike,
+                        'long_strike': long_opt.get('strike'),
+                        'spread_width': spread_width_actual,
+                        'short_bid': short_bid,
+                        'short_ask': short_opt.get('ask'),
+                        'long_bid': long_bid,
+                        'long_ask': long_ask,
+                        'credit': credit,
+                        'max_loss': max_loss,
+                        'margin_req': margin_req,
+                        'rom': rom,  # Return on Margin %
+                        'pop': pop,  # Probability of Profit %
+                        'short_delta': short_delta,
+                        'long_delta': long_delta,
+                        'short_volume': short_opt.get('volume'),
+                        'long_volume': long_opt.get('volume'),
+                        'short_iv': short_opt.get('impliedVol'),
+                        'long_iv': long_opt.get('impliedVol'),
+                    }
+                    spread_rows.append(spread_row)
+                    logger.info(f"    Spread found: {short_strike}/{long_opt.get('strike')}P credit=${credit:.2f} margin=${margin_req:.0f} ROM={rom:.1f}% POP={pop:.1f}%")
 
-        result = {
-            'symbol': symbol,
-            'stock_price': stock_data['last'] or stock_data['close'],
-            'currency': currency,
-            'expirations_processed': len(effective_month_indices),
-            'total_options': len(all_rows),
-            'top5': top5
-        }
+        # Combine regular options and spreads for output
+        if spread_mode:
+            # Sort spreads by ROM (Return on Margin)
+            spread_rows.sort(key=lambda x: x.get('rom', 0), reverse=True)
+            top5_spreads = spread_rows[:5]
+            # For spread mode, return spreads instead of single options
+            result = {
+                'symbol': symbol,
+                'stock_price': stock_data['last'] or stock_data['close'],
+                'currency': currency,
+                'expirations_processed': len(effective_month_indices),
+                'total_options': len(all_rows),
+                'total_spreads': len(spread_rows),
+                'top5': top5_spreads,
+                'is_spread': True
+            }
+        else:
+            # Regular single options mode
+            all_rows.sort(key=lambda x: x.get('put_profit', 0), reverse=True)
+            top5 = all_rows[:5]
+            
+            result = {
+                'symbol': symbol,
+                'stock_price': stock_data['last'] or stock_data['close'],
+                'currency': currency,
+                'expirations_processed': len(effective_month_indices),
+                'total_options': len(all_rows),
+                'top5': top5,
+                'is_spread': False
+            }
 
         if keep_connected:
             result['ib'] = ib
@@ -1060,6 +1473,11 @@ def main():
     output_dir = None  # Custom output directory
     bid_min = 0.80  # Minimum bid price
     bracket_mode = False  # Bracket Order (Take Profit 70% / Stop Loss 200%)
+    verbose = False  # Verbose logging
+    spread_mode = False  # Bull Put Spread Mode
+    spread_width = 5  # Strike width for spread (default 5 points)
+    max_margin = 1000  # Max margin per spread in USD
+    min_credit = 0.80  # Minimum credit target for spreads in USD
     if len(sys.argv) > 1:
         args = sys.argv[1:]
         symbols = []
@@ -1074,6 +1492,8 @@ def main():
             arg = args[i]
             if arg in ['-m', '--manual']:
                 manual_mode = True
+            elif arg in ['-v', '--verbose']:
+                verbose = True
             elif arg in ['--delta-min', '--dmin'] and i + 1 < len(args):
                 delta_min = float(args[i + 1])
                 i += 1
@@ -1085,8 +1505,8 @@ def main():
                 i += 1
             elif arg in ['--order-type', '--ot'] and i + 1 < len(args):
                 order_type = args[i + 1].upper()
-                if order_type not in ['LMT', 'REL']:
-                    print(f"Error: --order-type must be LMT or REL, got {order_type}")
+                if order_type not in ['LMT', 'REL', 'MKT']:
+                    print(f"Error: --order-type must be LMT, REL or MKT, got {order_type}")
                     sys.exit(1)
                 i += 1
             elif arg in ['--bid-min', '--bmin'] and i + 1 < len(args):
@@ -1094,6 +1514,17 @@ def main():
                 i += 1
             elif arg in ['--bracket', '-b']:
                 bracket_mode = True
+            elif arg in ['--spread', '--bull-put-spread']:
+                spread_mode = True
+            elif arg in ['--spread-width', '--sw'] and i + 1 < len(args):
+                spread_width = int(args[i + 1])
+                i += 1
+            elif arg in ['--max-margin', '--mm'] and i + 1 < len(args):
+                max_margin = float(args[i + 1])
+                i += 1
+            elif arg in ['--min-credit', '--mc'] and i + 1 < len(args):
+                min_credit = float(args[i + 1])
+                i += 1
             elif arg in ['--output-dir', '-o'] and i + 1 < len(args):
                 output_dir = args[i + 1]
                 i += 1
@@ -1123,6 +1554,21 @@ def main():
         exchange = 'SMART'
         currency = 'USD'
     
+    # Configure logging based on verbose flag
+    log_level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s : %(message)s')
+    
+    # Aggressively suppress ALL ib_insync loggers when not verbose
+    if not verbose:
+        for logger_name in ['ib_insync', 'ib_insync.ib', 'ib_insync.client', 'ib_insync.wrapper', 
+                           'ib_insync.contract', 'ib_insync.order', 'ib_insync.ticker', 'ib_insync.util']:
+            lg = logging.getLogger(logger_name)
+            lg.setLevel(logging.CRITICAL)  # Only CRITICAL through
+            lg.propagate = False  # Don't propagate to root logger
+    
+    # Set script's own logger level
+    logger.setLevel(log_level)
+    
     # Configurable output path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if output_dir:
@@ -1139,20 +1585,26 @@ def main():
     
     results = []
     # Use unique client IDs based on PID to avoid conflicts
-    base_client_id = (os.getpid() % 1000) * 1000
+    #base_client_id = (os.getpid() % 1000) * 1000
+    base_client_id=1
     for i, symbol in enumerate(symbols):
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing {symbol} ({i+1}/{len(symbols)})...")
         
         defaults = SYMBOL_DEFAULTS.get(symbol, {'exchange': exchange, 'currency': currency})
-        ex = exchange if exchange != 'SMART' else defaults['exchange']
-        cur = currency if currency != 'USD' else defaults['currency']
+        # Respect explicitly passed exchange/currency, only use defaults if not overridden
+        # Since default param is 'SMART'/'USD', we check if user provided non-default via sys.argv
+        # Simpler: always use passed exchange/currency (user intent), defaults only for fallback
+        ex = exchange
+        cur = currency
         
         # Don't keep connection for orders - create dedicated one later
         result = process_symbol(symbol, month_indices, ex, cur, base_client_id + i,
                                keep_connected=False, delta_min=delta_min, delta_max=delta_max,
                                num_chains=num_chains, order_type=order_type, bid_min=bid_min,
-                               bracket_mode=bracket_mode)
+                               bracket_mode=bracket_mode, spread_mode=spread_mode,
+                               spread_width=spread_width, max_margin=max_margin, min_credit=min_credit,
+                               verbose=verbose)
         results.append(result)
         
         if 'error' in result:
@@ -1178,13 +1630,22 @@ def main():
             print(f"\n❌ {res['symbol']}: {res['error']}")
             continue
         
-        print(f"\n📈 {res['symbol']} @ {res['stock_price']} {res['currency']} ({res['expirations_processed']} expirations)")
-        print(f"{'Strike':>8} | {'Exp':>10} | {'Delta':>7} | {'Bid':>6} | {'Ask':>6} | {'Vol':>5} | {'IV':>7} | {'Profit%':>8}")
-        print("-" * 85)
+        is_spread = res.get('is_spread', False)
         
-        for r in res['top5']:
-            exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
-            print(f"{r['strike']:>8.1f} | {exp_short:>10} | {r['delta']:>7.4f} | {r['bid']:>6.2f} | {r['ask']:>6.2f} | {r['volume']:>5.0f} | {r['impliedVol']:>6.2%} | {r['put_profit']:>7.2f}%")
+        if is_spread:
+            print(f"\n📈 {res['symbol']} @ {res['stock_price']} {res['currency']} ({res['expirations_processed']} expirations) — BULL PUT SPREADS")
+            print(f"{'Short':>7} | {'Long':>6} | {'W':>3} | {'Exp':>10} | {'Credit':>7} | {'Margin':>7} | {'ROM%':>6} | {'POP%':>5} | {'Short Δ':>7}")
+            print("-" * 85)
+            for r in res['top5']:
+                exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
+                print(f"{r['short_strike']:>7.1f} | {r['long_strike']:>6.1f} | {r['spread_width']:>3.0f} | {exp_short:>10} | ${r['credit']:>6.2f} | ${r['margin_req']:>6.0f} | {r['rom']:>5.1f}% | {r['pop']:>4.1f}% | {r['short_delta']:>7.4f}")
+        else:
+            print(f"\n📈 {res['symbol']} @ {res['stock_price']} {res['currency']} ({res['expirations_processed']} expirations)")
+            print(f"{'Strike':>8} | {'Exp':>10} | {'Delta':>7} | {'Bid':>6} | {'Ask':>6} | {'Vol':>5} | {'IV':>7} | {'Profit%':>8}")
+            print("-" * 85)
+            for r in res['top5']:
+                exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
+                print(f"{r['strike']:>8.1f} | {exp_short:>10} | {r['delta']:>7.4f} | {r['bid']:>6.2f} | {r['ask']:>6.2f} | {r['volume']:>5.0f} | {r['impliedVol']:>6.2%} | {r['put_profit']:>7.2f}%")
     
     # Collect all top options for auto-order
     all_top_options = []
@@ -1210,11 +1671,15 @@ def main():
         if manual_mode:
             # MANUAL MODE: User selects which option(s) to trade
             print(f"\n{'='*80}")
-            print(f"MANUAL MODE: Wählen Sie Option(en) zum Handeln")
+            is_spread_mode = spread_mode
+            if is_spread_mode:
+                print(f"MANUAL MODE: Wählen Sie Bull Put Spread(s) zum Handeln")
+            else:
+                print(f"MANUAL MODE: Wählen Sie Option(en) zum Handeln")
             print(f"{'='*80}")
         
             # Show all options with numbers
-            print(f"\nVerfügbare Optionen (Top 5 pro Symbol):")
+            print(f"\nVerfügbare {'Spreads' if is_spread_mode else 'Optionen'} (Top 5 pro Symbol):")
             for idx, r in enumerate(all_top_options):
                 exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
                 # Calculate DTE (Days to Expiration)
@@ -1224,7 +1689,10 @@ def main():
                 except Exception as e:
                     logger.warning(f"main: DTE calculation failed - {type(e).__name__}: {e}")
                     dte = '?'
-                print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
+                if is_spread_mode:
+                    print(f"  [{idx+1}] {r['symbol']} {r['short_strike']:.0f}/{r['long_strike']:.0f}P {exp_short} | DTE={dte}d | Credit=${r['credit']:.2f} | Margin=${r['margin_req']:.0f} | ROM={r['rom']:.1f}% | POP={r['pop']:.1f}% | Short Δ={r['short_delta']:.4f}")
+                else:
+                    print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
         
             print(f"\nEingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q' zum Beenden")
         
@@ -1238,15 +1706,19 @@ def main():
                     break
                 elif choice in ['l', 'list']:
                     # Re-list available options
-                    print(f"\nVerfügbare Optionen (Top 5 pro Symbol):")
+                    print(f"\nVerfügbare {'Spreads' if is_spread_mode else 'Optionen'} (Top 5 pro Symbol):")
                     for idx, r in enumerate(all_top_options):
                         exp_short = r['expiration'][4:] if len(r['expiration']) == 8 else r['expiration']
                         try:
                             exp_date = datetime.strptime(r['expiration'], '%Y%m%d')
                             dte = (exp_date - datetime.now()).days
-                        except:
+                        except Exception as e:
+                            logger.warning(f"main: DTE calculation failed - {type(e).__name__}: {e}")
                             dte = '?'
-                        print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
+                        if is_spread_mode:
+                            print(f"  [{idx+1}] {r['symbol']} {r['short_strike']:.0f}/{r['long_strike']:.0f}P {exp_short} | DTE={dte}d | Credit=${r['credit']:.2f} | Margin=${r['margin_req']:.0f} | ROM={r['rom']:.1f}% | POP={r['pop']:.1f}% | Short Δ={r['short_delta']:.4f}")
+                        else:
+                            print(f"  [{idx+1}] {r['symbol']} {r['strike']:.0f}P {exp_short} | DTE={dte}d | Delta={r['delta']:.4f} | Bid=${r['bid']:.2f} | Ask=${r['ask']:.2f} | Vol={r['volume']:.0f} | IV={r['impliedVol']:.1%} | Profit={r['put_profit']:.2f}%")
                     print(f"\nEingabe: Nummern (z.B. '1', '1,3', '1 3') oder 'q' zum Beenden")
                     continue
                 
@@ -1261,36 +1733,81 @@ def main():
 
                     for idx in valid:
                         selected = all_top_options[idx]
-                        # Place order for selected option
+                        # Place order for selected option/spread
                         try:
                             defaults = SYMBOL_DEFAULTS.get(selected['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
                             ex = defaults['exchange']
                             cur = defaults['currency']
                             
-                            # Use chain tradingClass if available
-                            trading_class = selected['symbol']  # fallback
-                            
-                            opt = create_put_option(selected['symbol'], selected['expiration'], 
-                                                   selected['strike'], selected['multiplier'],
-                                                   ex, trading_class)
-                            order_ib.qualifyContracts(opt)
-
-                            mark_price = get_mark_price(order_ib, opt)
-                            
-                            if order_type == 'LMT':
-                                limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
-                                print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                            if is_spread_mode:
+                                # BULL PUT SPREAD: Create both legs
+                                trading_class = selected['symbol']
+                                
+                                # Short leg (higher strike)
+                                short_opt = create_put_option(selected['symbol'], selected['expiration'],
+                                                             selected['short_strike'], selected.get('multiplier', 100),
+                                                             ex, trading_class)
+                                # Long leg (lower strike)
+                                long_opt = create_put_option(selected['symbol'], selected['expiration'],
+                                                            selected['long_strike'], selected.get('multiplier', 100),
+                                                            ex, trading_class)
+                                order_ib.qualifyContracts(short_opt, long_opt)
+                                
+                                print(f"\n>>> Platzieren BULL PUT SPREAD:")
+                                print(f"   Short: SELL 1 {short_opt.localSymbol}")
+                                print(f"   Long:  BUY  1 {long_opt.localSymbol}")
+                                print(f"   Credit Target: ${selected['credit']:.2f} | Margin: ${selected['margin_req']:.0f}")
+                                
+                                placed = place_spread_order(order_ib, short_opt, long_opt,
+                                                          quantity=1, order_type=order_type,
+                                                          credit_limit_price=selected['credit'],
+                                                          auto_transmit=False, verbose=verbose)
+                                if placed and isinstance(placed, dict) and placed.get('success'):
+                                    print(f"✅ {selected['symbol']} BULL PUT SPREAD erfolgreich platziert!")
+                                    # Attach OCA TP/SL orders
+                                    print(f"\n>>> OCA Stop-Loss / Take-Profit für Spread anhängen?")
+                                    print(f"   Standard: TP 70% (${selected['credit'] * 0.30:.2f}) / SL 100% (${selected['credit'] * 2.00:.2f})")
+                                    try:
+                                        oca_choice = input("   OCA anhängen? (y/n): ").strip().lower()
+                                        if oca_choice in ['y', 'yes', 'j', 'ja']:
+                                            place_spread_oca_orders(order_ib, short_opt, long_opt,
+                                                                   quantity=1, net_credit=placed['net_credit'],
+                                                                   take_profit_pct=0.30, stop_loss_pct=2.00,
+                                                                   verbose=verbose)
+                                    except (EOFError, KeyboardInterrupt):
+                                        pass
+                                elif placed:
+                                    print(f"✅ {selected['symbol']} BULL PUT SPREAD erfolgreich platziert!")
+                                else:
+                                    print(f"❌ {selected['symbol']} Spread Order nicht platziert.")
                             else:
-                                limit_price = None
-                                mid_price = mark_price if mark_price and mark_price > 0 else selected['bid']
-                                print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
-                            placed = place_option_order(order_ib, opt, action='SELL', quantity=1, 
-                                                       order_type=order_type, limit_price=limit_price, 
-                                                       auto_transmit=False, bracket=bracket_mode)
-                            if placed:
-                                print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
-                            else:
-                                print(f"❌ {selected['symbol']} Order nicht platziert.")
+                                # Regular single option
+                                trading_class = selected['symbol']  # fallback
+                                
+                                opt = create_put_option(selected['symbol'], selected['expiration'],
+                                                       selected['strike'], selected['multiplier'],
+                                                       ex, trading_class)
+                                order_ib.qualifyContracts(opt)
+                                
+                                mark_price = get_mark_price(order_ib, opt)
+                                
+                                if order_type == 'LMT':
+                                    limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else selected['bid']
+                                    print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                                elif order_type == 'REL':
+                                    limit_price = None
+                                    mid_price = mark_price if mark_price and mark_price > 0 else selected['bid']
+                                    print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
+                                elif order_type == 'MKT':
+                                    limit_price = None
+                                    print(f"\n>>> Platzieren SELL 1 {opt.localSymbol} @ MKT (Market Order)")
+                                placed = place_option_order(order_ib, opt, action='SELL', quantity=1,
+                                                           order_type=order_type, limit_price=limit_price,
+                                                           auto_transmit=False, bracket=bracket_mode)
+                                if placed:
+                                    print(f"✅ {selected['symbol']} PUT Order erfolgreich platziert!")
+                                else:
+                                    print(f"❌ {selected['symbol']} Order nicht platziert.")
                         except Exception as e:
                             handle_ibkr_error(f"main(manual:{selected['symbol']})", e, logger)
                             print(f"❌ {selected['symbol']} Fehler: {e}")
@@ -1304,57 +1821,104 @@ def main():
                 except Exception as e:
                     handle_ibkr_error("main(manual loop)", e, logger)
         else:
-            # AUTO MODE: Best PUT per Symbol
+            # AUTO MODE: Best PUT per Symbol or Best SPREAD per Symbol
             print(f"\n{'='*80}")
-            print(f"AUTO-ORDER: Best PUT Options per Symbol")
+            if spread_mode:
+                print(f"AUTO-ORDER: Best BULL PUT SPREAD per Symbol")
+            else:
+                print(f"AUTO-ORDER: Best PUT Options per Symbol")
             print(f"{'='*80}")
         
-            # Find best option per symbol - nur für gescannte Symbole
+            # Find best option/spread per symbol
             for symbol in symbols:
                 symbol_options = [r for r in all_top_options if r['symbol'] == symbol]
                 if not symbol_options:
                     continue
             
-                best = max(symbol_options, key=lambda x: x['put_profit'])
-                print(f"\nBeste {symbol} Option: {best['symbol']} {best['strike']:.0f}P {best['expiration'][4:]}")
-                print(f"Delta={best['delta']:.4f} | Bid=${best['bid']:.2f} | Put_Profit={best['put_profit']:.2f}%")
+                if spread_mode:
+                    best = max(symbol_options, key=lambda x: x.get('rom', 0))
+                    print(f"\nBester {symbol} Spread: {best['symbol']} {best['short_strike']:.0f}/{best['long_strike']:.0f}P {best['expiration'][4:]}")
+                    print(f"Credit=${best['credit']:.2f} | Margin=${best['margin_req']:.0f} | ROM={best['rom']:.1f}% | POP={best['pop']:.1f}% | Short Δ={best['short_delta']:.4f}")
+                else:
+                    best = max(symbol_options, key=lambda x: x['put_profit'])
+                    print(f"\nBeste {symbol} Option: {best['symbol']} {best['strike']:.0f}P {best['expiration'][4:]}")
+                    print(f"Delta={best['delta']:.4f} | Bid=${best['bid']:.2f} | Put_Profit={best['put_profit']:.2f}%")
             
                 if order_ib and order_ib.isConnected():
                     try:
-                        # Restore option contract
                         defaults = SYMBOL_DEFAULTS.get(best['symbol'].upper(), {'exchange': 'SMART', 'currency': 'USD'})
                         ex = defaults['exchange']
                         cur = defaults['currency']
                         
-                        trading_class = best['symbol']  # fallback
-                        
-                        opt = create_put_option(best['symbol'], best['expiration'], 
-                                               best['strike'], best['multiplier'],
-                                               ex, trading_class)
-                        try:
-                            order_ib.qualifyContracts(opt)
-                        except RequestError as e:
-                            logger.error(f"main(auto:{symbol}): qualifyContracts failed - {e}")
-                            print(f"❌ {symbol} qualifyContracts fehlgeschlagen: {e}")
-                            continue
-
-                        # Auto-place order (SELL 1 contract at MARK - 0.05) mit Bestätigung
-                        mark_price = get_mark_price(order_ib, opt)
-
-                        if order_type == 'LMT':
-                            limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
-                            print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                        if spread_mode:
+                            # BULL PUT SPREAD
+                            trading_class = best['symbol']
+                            short_opt = create_put_option(best['symbol'], best['expiration'],
+                                                         best['short_strike'], best.get('multiplier', 100),
+                                                         ex, trading_class)
+                            long_opt = create_put_option(best['symbol'], best['expiration'],
+                                                        best['long_strike'], best.get('multiplier', 100),
+                                                        ex, trading_class)
+                            try:
+                                order_ib.qualifyContracts(short_opt, long_opt)
+                            except RequestError as e:
+                                logger.error(f"main(auto:{symbol}): qualifyContracts failed - {e}")
+                                print(f"❌ {symbol} qualifyContracts fehlgeschlagen: {e}")
+                                continue
+                            
+                            print(f"\n>>> Auto-Platzieren BULL PUT SPREAD:")
+                            print(f"   Short: SELL 1 {short_opt.localSymbol}")
+                            print(f"   Long:  BUY  1 {long_opt.localSymbol}")
+                            print(f"   Credit Target: ${best['credit']:.2f} | Margin: ${best['margin_req']:.0f}")
+                            
+                            placed = place_spread_order(order_ib, short_opt, long_opt,
+                                                      quantity=1, order_type=order_type,
+                                                      credit_limit_price=best['credit'],
+                                                      auto_transmit=False, verbose=verbose)
+                            if placed and isinstance(placed, dict) and placed.get('success'):
+                                print(f"✅ {symbol} BULL PUT SPREAD erfolgreich platziert!")
+                                # Auto-attach OCA TP/SL
+                                print(f"\n>>> Auto-anhängen: OCA Stop-Loss / Take-Profit")
+                                place_spread_oca_orders(order_ib, short_opt, long_opt,
+                                                       quantity=1, net_credit=placed['net_credit'],
+                                                       take_profit_pct=0.30, stop_loss_pct=2.00,
+                                                       verbose=verbose)
+                            elif placed:
+                                print(f"✅ {symbol} BULL PUT SPREAD erfolgreich platziert!")
+                            else:
+                                print(f"❌ {symbol} Spread Order nicht platziert.")
                         else:
-                            limit_price = None
-                            mid_price = mark_price if mark_price and mark_price > 0 else best['bid']
-                            print(f">>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
-                        placed = place_option_order(order_ib, opt, action='SELL', quantity=1, 
-                                                   order_type=order_type, limit_price=limit_price, 
-                                                   auto_transmit=False, bracket=bracket_mode)
-                        if placed:
-                            print(f"✅ {symbol} PUT Order erfolgreich platziert!")
-                        else:
-                            print(f"❌ {symbol} Order nicht platziert.")
+                            # Regular single option
+                            trading_class = best['symbol']
+                            opt = create_put_option(best['symbol'], best['expiration'],
+                                                   best['strike'], best['multiplier'],
+                                                   ex, trading_class)
+                            try:
+                                order_ib.qualifyContracts(opt)
+                            except RequestError as e:
+                                logger.error(f"main(auto:{symbol}): qualifyContracts failed - {e}")
+                                print(f"❌ {symbol} qualifyContracts fehlgeschlagen: {e}")
+                                continue
+                            
+                            mark_price = get_mark_price(order_ib, opt)
+                            
+                            if order_type == 'LMT':
+                                limit_price = round(mark_price - 0.05, 2) if mark_price and mark_price > 0 else best['bid']
+                                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ ${limit_price:.2f} LMT (Mark: ${mark_price:.2f} - $0.05)")
+                            elif order_type == 'REL':
+                                limit_price = None
+                                mid_price = mark_price if mark_price and mark_price > 0 else best['bid']
+                                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ REL (Midpoint, Mark: ${mid_price:.2f})")
+                            elif order_type == 'MKT':
+                                limit_price = None
+                                print(f">>> Platzieren SELL 1 {opt.localSymbol} @ MKT (Market Order)")
+                            placed = place_option_order(order_ib, opt, action='SELL', quantity=1,
+                                                       order_type=order_type, limit_price=limit_price,
+                                                       auto_transmit=False, bracket=bracket_mode)
+                            if placed:
+                                print(f"✅ {symbol} PUT Order erfolgreich platziert!")
+                            else:
+                                print(f"❌ {symbol} Order nicht platziert.")
                     except Exception as e:
                         handle_ibkr_error(f"main(auto:{symbol})", e, logger)
                         print(f"Fehler: {e}")

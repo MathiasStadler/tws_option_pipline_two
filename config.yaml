@@ -1,0 +1,76 @@
+# TWS Option Pipeline Configuration
+# Copy to config.yaml and adjust as needed
+
+ibkr:
+  host: "127.0.0.1"
+  port: 7496              # TWS Socket API (Live: 7496, Paper: 7497)
+  readonly_port: 4002     # Gateway REST API (optional)
+  client_id_base: 1000    # Base for unique client IDs (PID-based offset added)
+  market_data_type: 4     # 1=Live, 2=Frozen, 3=Delayed, 4=Delayed-Frozen (Paper)
+  connection_timeout: 15  # Seconds
+  readonly: true          # Use readonly API (no trading permissions needed for scanning)
+
+spread:
+  default_width: 5              # Strike width in points
+  default_max_margin: 1000      # Max margin per spread (USD)
+  default_min_credit: 0.80      # Minimum credit target (USD)
+  take_profit_pct: 0.30         # TP at 30% of credit = 70% profit
+  stop_loss_pct: 2.00           # SL at 200% of credit = 100% loss
+
+filters:
+  delta_min: -0.50              # Short PUT delta lower bound
+  delta_max: -0.10              # Short PUT delta upper bound
+  bid_min: 0.80                 # Minimum bid price (USD)
+  max_dte: 45                   # Maximum days to expiration
+  min_dte: 7                    # Minimum days to expiration (avoid 0DTE)
+  require_5_point_strikes: true # Only 5-point strikes (liquid US standard)
+
+limits:
+  max_positions_per_symbol: 3   # Max open spreads per symbol
+  max_total_margin_pct: 0.80    # Max 80% of available funds
+  max_open_orders: 20           # Safety cap
+
+scanning:
+  max_strikes_per_chain: 5      # Limit market data requests (Paper delayed data)
+  greeks_batch_sleep: 3         # Seconds to wait for batch greeks
+  mark_price_sleep: 2           # Seconds for mark price snapshot
+
+orders:
+  default_type: "LMT"           # LMT, REL, MKT
+  default_quantity: 1           # Contracts per spread
+  tif: "DAY"                    # Time in force
+  oca_type: 1                   # 1=Cancel all, 2=Reduce size, 3=Cancel with block
+  sl_limit_buffer: 0.05         # Extra $ for SL limit price (fill safety)
+
+output:
+  directory: "./output"
+  csv_prefix: "multi_symbol_top5"
+  html_report: true
+  console_summary: true
+
+logging:
+  level: "WARNING"              # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+  suppress_ib_insync: true      # Hide noisy ib_insync logs unless verbose
+
+# Symbol-specific overrides (exchange, currency, trading class)
+symbols:
+  ALV:   {exchange: "XETRA", currency: "EUR"}
+  ASML:  {exchange: "AEB",   currency: "EUR"}
+  SAP:   {exchange: "XETRA", currency: "EUR"}
+  SIE:   {exchange: "XETRA", currency: "EUR"}
+  VOW3:  {exchange: "XETRA", currency: "EUR"}
+  BMW:   {exchange: "XETRA", currency: "EUR"}
+  DTE:   {exchange: "XETRA", currency: "EUR"}
+  BAYN:  {exchange: "XETRA", currency: "EUR"}
+  BAS:   {exchange: "XETRA", currency: "EUR"}
+  DHL:   {exchange: "XETRA", currency: "EUR"}
+  CROX:  {exchange: "SMART", currency: "USD"}
+  TREX:  {exchange: "SMART", currency: "USD"}
+  AAPL:  {exchange: "SMART", currency: "USD"}
+  MSFT:  {exchange: "SMART", currency: "USD"}
+  TSLA:  {exchange: "SMART", currency: "USD"}
+  NVDA:  {exchange: "SMART", currency: "USD"}
+  AMD:   {exchange: "SMART", currency: "USD"}
+  SPY:   {exchange: "SMART", currency: "USD"}
+  QQQ:   {exchange: "SMART", currency: "USD"}
